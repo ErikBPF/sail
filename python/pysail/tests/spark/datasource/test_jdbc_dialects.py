@@ -48,6 +48,27 @@ def _count_names(sa_url, table):
     return len(rows), {r[0] for r in rows}
 
 
+def _drop_table(sa_url, table):
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(sa_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(sa.text(f"DROP TABLE IF EXISTS {table}"))
+    finally:
+        engine.dispose()
+
+
+def _column_names(sa_url, table):
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(sa_url)
+    try:
+        return [column["name"] for column in sa.inspect(engine).get_columns(table)]
+    finally:
+        engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # MySQL
 # ---------------------------------------------------------------------------
@@ -105,6 +126,41 @@ def test_mysql_write_overwrite(spark, mysql_table):
     count, names = _count_names(sa_url, table)
     assert count == 1
     assert names == {"Charlie"}
+
+
+@pytest.mark.parametrize("mode", [None, "append", "overwrite"])
+def test_mysql_write_creates_missing_table(spark, mysql_ctx, mode):
+    opts, sa_url = mysql_ctx
+    table = f"wt_mysql_create_{mode or 'default'}"
+    _drop_table(sa_url, table)
+    try:
+        df = spark.createDataFrame([(1, "Alice", 9.5)], _schema())
+        writer = df.write.format("jdbc").option("dbtable", table).options(**opts)
+        if mode is not None:
+            writer = writer.mode(mode)
+        writer.save()
+        assert _count_names(sa_url, table) == (1, {"Alice"})
+    finally:
+        _drop_table(sa_url, table)
+
+
+def test_mysql_default_overwrite_replaces_schema(spark, mysql_table):
+    table, opts, sa_url = mysql_table
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    df = spark.createDataFrame(
+        [(7, "seven")], StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
+    )
+    df.write.format("jdbc").option("dbtable", table).options(**opts).mode("overwrite").save()
+    assert _column_names(sa_url, table) == ["new_id", "label"]
+
+
+def test_mysql_truncate_overwrite_preserves_schema(spark, mysql_table):
+    table, opts, sa_url = mysql_table
+    df = spark.createDataFrame([(3, "Charlie", 8.8)], _schema())
+    df.write.format("jdbc").option("dbtable", table).option("truncate", "true").options(**opts).mode("overwrite").save()
+    assert _column_names(sa_url, table) == ["id", "name", "score"]
+    assert _count_names(sa_url, table) == (1, {"Charlie"})
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +302,38 @@ def test_mssql_write_overwrite(spark, mssql_table):
     count, names = _count_names(sa_url, table)
     assert count == 1
     assert names == {"Charlie"}
+
+
+@pytest.mark.parametrize("mode", [None, "append", "overwrite"])
+def test_mssql_write_creates_missing_table(spark, mssql_ctx, mode):
+    opts, sa_url = mssql_ctx
+    table = f"wt_mssql_create_{mode or 'default'}"
+    _drop_table(sa_url, table)
+    try:
+        df = spark.createDataFrame([(1, "Alice", 9.5)], _schema())
+        writer = df.write.format("jdbc").option("dbtable", table).options(**opts)
+        if mode is not None:
+            writer = writer.mode(mode)
+        writer.save()
+        assert _count_names(sa_url, table) == (1, {"Alice"})
+    finally:
+        _drop_table(sa_url, table)
+
+
+def test_mssql_default_overwrite_replaces_schema(spark, mssql_table):
+    table, opts, sa_url = mssql_table
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    df = spark.createDataFrame(
+        [(7, "seven")], StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
+    )
+    df.write.format("jdbc").option("dbtable", table).options(**opts).mode("overwrite").save()
+    assert _column_names(sa_url, table) == ["new_id", "label"]
+
+
+def test_mssql_truncate_overwrite_preserves_schema(spark, mssql_table):
+    table, opts, sa_url = mssql_table
+    df = spark.createDataFrame([(3, "Charlie", 8.8)], _schema())
+    df.write.format("jdbc").option("dbtable", table).option("truncate", "true").options(**opts).mode("overwrite").save()
+    assert _column_names(sa_url, table) == ["id", "name", "score"]
+    assert _count_names(sa_url, table) == (1, {"Charlie"})

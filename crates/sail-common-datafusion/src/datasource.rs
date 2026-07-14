@@ -60,19 +60,27 @@ pub enum OptionLayer {
 }
 
 impl OptionLayer {
+    /// Converts this option layer into ordered opaque key-value pairs.
+    ///
+    /// Unlike [`Self::into_opaque_options`], this preserves insertion order so
+    /// consumers can implement deterministic case-insensitive last-value-wins
+    /// semantics before collecting into a map.
+    pub fn into_opaque_option_items(self) -> Vec<(String, String)> {
+        match self {
+            OptionLayer::TablePropertyList { items } | OptionLayer::OptionList { items } => items,
+            OptionLayer::TableLocation { .. }
+            | OptionLayer::AsOfTimestamp { .. }
+            | OptionLayer::AsOfIntegerVersion { .. }
+            | OptionLayer::AsOfStringVersion { .. } => Vec::new(),
+        }
+    }
+
     /// Converts this option layer into an opaque key-value map.
     ///
     /// This is used when a data source consumes untyped key-value options.
     /// The returned map can be passed to code that accepts `HashMap<String, String>`.
     pub fn into_opaque_options(self) -> HashMap<String, String> {
-        match self {
-            OptionLayer::TablePropertyList { items } => items.into_iter().collect(),
-            OptionLayer::OptionList { items } => items.into_iter().collect(),
-            OptionLayer::TableLocation { .. }
-            | OptionLayer::AsOfTimestamp { .. }
-            | OptionLayer::AsOfIntegerVersion { .. }
-            | OptionLayer::AsOfStringVersion { .. } => HashMap::new(),
-        }
+        self.into_opaque_option_items().into_iter().collect()
     }
 }
 

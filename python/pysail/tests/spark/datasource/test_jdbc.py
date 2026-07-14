@@ -626,14 +626,94 @@ def test_write_append_basic(spark, jdbc_opts, write_table):
     assert names == {"Alice", "Bob", "Charlie"}
 
 
-def test_write_missing_target_raises(spark, jdbc_opts):
-    """Writing to a non-existent target fails fast with a clear message (no auto-create)."""
+@pytest.mark.parametrize("mode", [None, "append", "overwrite"])
+def test_write_creates_missing_target(spark, jdbc_opts, pg_dsn, mode):
+    """Every Spark save mode that writes creates a missing target."""
+    import psycopg
     from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
     schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
     df = spark.createDataFrame([(1, "Alice")], schema)
-    with pytest.raises(Exception, match="does not exist"):
-        df.write.format("jdbc").option("dbtable", "no_such_table_xyz").options(**jdbc_opts).mode("append").save()
+    table = f"wt_auto_create_{mode or 'default'}"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+    try:
+        writer = df.write.format("jdbc").option("dbtable", table).options(**jdbc_opts)
+        if mode is not None:
+            writer = writer.mode(mode)
+        writer.save()
+        result = _read_pg_table(spark, jdbc_opts, table)
+        rows = result.collect()
+        assert len(rows) == 1
+        assert rows[0].asDict() == {"id": 1, "name": "Alice"}
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.parametrize("write_table", ["wt_default_mode"], indirect=True)
+def test_write_default_mode_rejects_existing_target(spark, jdbc_opts, write_table):
+    """Spark's default errorIfExists mode must not silently append."""
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+    df = spark.createDataFrame([(1, "Alice")], schema)
+    with pytest.raises(Exception, match="already exists"):
+        df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).save()
+
+
+@pytest.mark.parametrize("write_table", ["wt_ignore_mode"], indirect=True)
+def test_write_ignore_preserves_existing_target(spark, jdbc_opts, pg_dsn, write_table):
+    """Ignore mode leaves an existing table unchanged."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'INSERT INTO "{write_table}" VALUES (99, %s, 1.0)', ("old",))  # noqa: S608
+    schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+    df = spark.createDataFrame([(1, "new")], schema)
+    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("ignore").save()
+
+    result = _read_pg_table(spark, jdbc_opts, write_table)
+    assert [(r.id, r.name) for r in result.collect()] == [(99, "old")]
+
+
+@pytest.mark.parametrize("write_table", ["wt_schema_replace"], indirect=True)
+def test_write_overwrite_replaces_schema(spark, jdbc_opts, pg_dsn, write_table):
+    """Default overwrite recreates the target from the DataFrame schema."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    schema = StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
+    df = spark.createDataFrame([(7, "seven")], schema)
+    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("overwrite").save()
+
+    with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s ORDER BY ordinal_position",
+            (write_table,),
+        )
+        assert [row[0] for row in cur.fetchall()] == ["new_id", "label"]
+        cur.execute(f'SELECT new_id, label FROM "{write_table}"')  # noqa: S608
+        assert cur.fetchall() == [(7, "seven")]
+
+
+@pytest.mark.parametrize("write_table", ["wt_pg_truncate_option"], indirect=True)
+def test_postgres_truncate_option_uses_spark_drop_recreate(spark, jdbc_opts, pg_dsn, write_table):
+    """PostgresDialect ignores truncate=true, so overwrite still replaces schema."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE INDEX "{write_table}_name_idx" ON "{write_table}" (name)')
+    df = spark.createDataFrame([(7,)], StructType([StructField("new_id", IntegerType())]))
+    df.write.format("jdbc").option("dbtable", write_table).option("truncate", "true").options(**jdbc_opts).mode(
+        "overwrite"
+    ).save()
+
+    with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", (f"{write_table}_name_idx",))
+        assert cur.fetchone()[0] is None
 
 
 @pytest.mark.parametrize("write_table", ["wt_overwrite"], indirect=True)
