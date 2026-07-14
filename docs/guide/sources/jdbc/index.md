@@ -194,23 +194,23 @@ ignored.
 
 - **append** — direct ingest into the target. At-least-once: a retried/speculated
   Spark task re-ingests its rows (matches Spark's built-in JDBC writer, which
-  makes no exactly-once guarantee), so the target may gain duplicates. This
-  applies to **both** the PostgreSQL and the MySQL/SQL Server backends. Use a
-  unique constraint (plus `ON CONFLICT` on PostgreSQL) if you need exactly-once.
-- **overwrite**:
-  - PostgreSQL — controlled by `overwriteMode`. `atomic` (default) loads all
+  makes no exactly-once guarantee), so the target may gain duplicates.
+- **overwrite** — by default, drops and recreates the target from the DataFrame
+  schema before writing, matching Spark's built-in JDBC writer. For MySQL and
+  SQL Server, `truncate=true` truncates instead, preserving the table schema and
+  metadata. Spark's PostgreSQL dialect does not support this optimization, so
+  PostgreSQL ignores `truncate=true` and still drops/recreates.
+  - PostgreSQL also supports the Sail extension `overwriteMode=atomic`, which loads all
     partitions into one staging table, then swaps it over the target in a single
     `DROP; RENAME` transaction (replaces the table object, so grants/ACLs/RLS are
     **not** preserved); the target is never left partially written. It is, however,
     **at-least-once** under Spark task retry / speculative execution — a re-run
     partition re-ingests into the shared staging, so the swapped-in table can contain
-    duplicates (same as `append`); disable speculation for exactly-once overwrite. `truncate`
+    duplicates (same as `append`); disable speculation for exactly-once overwrite.
+    `overwriteMode=truncate`
     `TRUNCATE`s the target once then ingests directly, preserving the table object
-    but **non-atomically** — if a task fails mid-job the target is left partially
-    populated (Spark documents the same caveat and advises turning `truncate` off
-    on failure). Prefer `atomic` unless the table object must survive.
-  - MySQL / SQL Server — each partition loads into a staging table, then the
-    driver swaps them in via a single `DELETE` + `INSERT … SELECT` transaction.
+    but **non-atomically**. These extension modes intentionally differ from Spark
+    and must be requested explicitly.
 
 ::: warning
 Concurrent overwrites to the same table are **not supported**. Two overwrite jobs
@@ -224,7 +224,10 @@ mode, `*__sail_trunc_*`) tables behind. They are safe to drop manually.
 | Write option    | Default  | Description                                        |
 | --------------- | -------- | -------------------------------------------------- |
 | `dbtable`       |          | Target table (required; `query` not allowed)       |
-| `overwriteMode` | `atomic` | `atomic` or `truncate` (PostgreSQL overwrite only) |
+| `truncate`      | `false`  | Preserve table on MySQL/SQL Server overwrite      |
+| `overwriteMode` | `spark`  | `spark`, `atomic`, or `truncate` (PostgreSQL only) |
 | `batchsize`     | `65536`  | Rows per ingest call                               |
 
-The target table must already exist.
+In explicit `append` or `overwrite` mode, a missing target is created from the
+DataFrame schema. PySpark's Python data-source API currently rejects the default
+`errorIfExists` mode before the JDBC writer runs, so specify a mode explicitly.

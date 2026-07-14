@@ -25,6 +25,24 @@ use super::discovery::DATA_SOURCE_REGISTRY;
 use super::executor::InProcessExecutor;
 use super::table_provider::PythonTableProvider;
 
+fn merge_opaque_options(options: &[(String, String)]) -> HashMap<String, String> {
+    options
+        .iter()
+        .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+        .collect()
+}
+
+fn sink_mode_name(mode: &SinkMode) -> &'static str {
+    match mode {
+        SinkMode::ErrorIfExists => "errorifexists",
+        SinkMode::IgnoreIfExists => "ignore",
+        SinkMode::Append => "append",
+        SinkMode::Overwrite | SinkMode::OverwriteIf { .. } | SinkMode::OverwritePartitions => {
+            "overwrite"
+        }
+    }
+}
+
 /// TableFormat implementation for a Python data source.
 ///
 /// Each registered Python datasource gets its own PythonTableFormat instance,
@@ -98,7 +116,7 @@ impl PythonTableFormat {
     }
 
     /// Create PythonDataSource from options.
-    fn create_datasource(&self, options: &[HashMap<String, String>]) -> Result<PythonDataSource> {
+    fn create_datasource(&self, options: &[(String, String)]) -> Result<PythonDataSource> {
         // Get pickled class bytes: prefer embedded (session-scoped) over global registry
         let pickled_class = match &self.pickled_class {
             Some(bytes) => bytes.clone(),
@@ -115,11 +133,7 @@ impl PythonTableFormat {
         };
 
         // Merge options
-        let merged_options: HashMap<String, String> = options
-            .iter()
-            .flat_map(|m| m.iter())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let merged_options = merge_opaque_options(options);
 
         // Create datasource instance with options
         self.instantiate_datasource(&pickled_class, merged_options)
@@ -181,10 +195,10 @@ impl TableFormat for PythonTableFormat {
         info: SourceInfo,
     ) -> Result<Arc<dyn TableSource>> {
         // Create PythonDataSource from options
-        let opaque_options: Vec<HashMap<String, String>> = info
+        let opaque_options: Vec<(String, String)> = info
             .options
             .into_iter()
-            .map(|l| l.into_opaque_options())
+            .flat_map(|l| l.into_opaque_option_items())
             .collect();
         let datasource = self.create_datasource(&opaque_options)?;
 
@@ -326,11 +340,15 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
             node.mode,
             SinkMode::Overwrite | SinkMode::OverwriteIf { .. } | SinkMode::OverwritePartitions
         );
-        let opaque_options: Vec<HashMap<String, String>> = node
+        let opaque_options: Vec<(String, String)> = node
             .options
             .clone()
             .into_iter()
-            .map(|l| l.into_opaque_options())
+            .flat_map(|l| l.into_opaque_option_items())
+            .chain(std::iter::once((
+                "__sail_save_mode".to_string(),
+                sink_mode_name(&node.mode).to_string(),
+            )))
             .collect();
         let table_format = PythonTableFormat {
             name: node.name.clone(),
@@ -370,5 +388,26 @@ mod tests {
     fn test_python_table_format_name() {
         let format = PythonTableFormat::new("test_datasource".to_string());
         assert_eq!(format.name(), "test_datasource");
+    }
+
+    #[test]
+    fn test_sink_mode_name_preserves_all_v1_modes() {
+        assert_eq!(sink_mode_name(&SinkMode::ErrorIfExists), "errorifexists");
+        assert_eq!(sink_mode_name(&SinkMode::IgnoreIfExists), "ignore");
+        assert_eq!(sink_mode_name(&SinkMode::Append), "append");
+        assert_eq!(sink_mode_name(&SinkMode::Overwrite), "overwrite");
+    }
+
+    #[test]
+    fn test_merge_opaque_options_is_case_insensitive_and_ordered() {
+        let options = vec![
+            ("URL".to_string(), "first".to_string()),
+            ("url".to_string(), "second".to_string()),
+            ("DbTable".to_string(), "items".to_string()),
+        ];
+        let merged = merge_opaque_options(&options);
+        assert_eq!(merged.get("url").map(String::as_str), Some("second"));
+        assert_eq!(merged.get("dbtable").map(String::as_str), Some("items"));
+        assert_eq!(merged.len(), 2);
     }
 }
