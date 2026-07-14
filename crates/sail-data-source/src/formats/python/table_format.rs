@@ -225,6 +225,7 @@ impl TableFormat for PythonTableFormat {
             mode,
             partition_by,
             options,
+            write_case_sensitive,
             ..
         } = info;
 
@@ -247,6 +248,7 @@ impl TableFormat for PythonTableFormat {
                 self.pickled_class.clone(),
                 mode,
                 options,
+                write_case_sensitive,
             )),
         }))
     }
@@ -260,6 +262,7 @@ pub struct PythonWriteNode {
     pickled_class: Option<Vec<u8>>,
     mode: SinkMode,
     options: Vec<OptionLayer>,
+    write_case_sensitive: bool,
     #[educe(PartialOrd(ignore))]
     schema: DFSchemaRef,
 }
@@ -271,6 +274,7 @@ impl PythonWriteNode {
         pickled_class: Option<Vec<u8>>,
         mode: SinkMode,
         options: Vec<OptionLayer>,
+        write_case_sensitive: bool,
     ) -> Self {
         Self {
             input,
@@ -278,6 +282,7 @@ impl PythonWriteNode {
             pickled_class,
             mode,
             options,
+            write_case_sensitive,
             schema: Arc::new(DFSchema::empty()),
         }
     }
@@ -312,6 +317,7 @@ impl UserDefinedLogicalNodeCore for PythonWriteNode {
             pickled_class: self.pickled_class.clone(),
             mode: self.mode.clone(),
             options: self.options.clone(),
+            write_case_sensitive: self.write_case_sensitive,
             schema: self.schema.clone(),
         })
     }
@@ -348,6 +354,10 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
             .chain(std::iter::once((
                 "__sail_save_mode".to_string(),
                 sink_mode_name(&node.mode).to_string(),
+            )))
+            .chain(std::iter::once((
+                "__sail_case_sensitive".to_string(),
+                node.write_case_sensitive.to_string(),
             )))
             .collect();
         let table_format = PythonTableFormat {

@@ -409,6 +409,7 @@ class PgWriteEngine:
         overwrite_mode: str = "append",
         batch_size: int = 65_536,
         run_id: str | None = None,
+        case_sensitive: bool = False,
     ) -> None:
         if overwrite_mode not in self._VALID_MODES:
             msg = f"Invalid overwrite_mode {overwrite_mode!r}. Valid values: {sorted(self._VALID_MODES)}"
@@ -421,6 +422,7 @@ class PgWriteEngine:
         self.dbtable = dbtable
         self.overwrite_mode = overwrite_mode
         self.batch_size = batch_size
+        self.case_sensitive = case_sensitive
         if run_id is None:
             import uuid  # noqa: PLC0415
 
@@ -501,6 +503,12 @@ class PgWriteEngine:
 
         rows = 0
         if table_obj is not None and table_obj.num_rows > 0:
+            resolved = _resolve_column_names(
+                table_obj.column_names,
+                _pg_target_columns(self.dsn, self.dbtable),
+                case_sensitive=self.case_sensitive,
+            )
+            table_obj = table_obj.rename_columns(resolved)
             ingest_schema, ingest_table = _split_schema(target)
             try:
                 with pg_dbapi.connect(self.dsn) as conn:
@@ -702,23 +710,57 @@ def _arrow_to_sqlalchemy_type(arrow_type: pa.DataType, dialect: str | None = Non
 
         if pa.types.is_boolean(arrow_type):
             return mysql.BIT(1)
+        if pa.types.is_int8(arrow_type):
+            return mysql.TINYINT()
+        if pa.types.is_int16(arrow_type):
+            return mysql.SMALLINT()
+        if pa.types.is_int32(arrow_type):
+            return mysql.INTEGER()
+        if pa.types.is_int64(arrow_type):
+            return mysql.BIGINT()
         if pa.types.is_float32(arrow_type):
             return mysql.FLOAT()
         if pa.types.is_float64(arrow_type):
             return mysql.DOUBLE()
+        if pa.types.is_decimal(arrow_type):
+            return mysql.DECIMAL(precision=arrow_type.precision, scale=arrow_type.scale)
+        if pa.types.is_date(arrow_type):
+            return mysql.DATE()
+        if pa.types.is_timestamp(arrow_type):
+            return mysql.TIMESTAMP() if arrow_type.tz is not None else mysql.DATETIME()
         if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
             return mysql.LONGTEXT()
         if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
-            return mysql.LONGBLOB()
+            return mysql.BLOB()
+        msg = f"Spark JDBC does not support automatic MySQL table creation for Arrow type {arrow_type}."
+        raise TypeError(msg)
     if dialect == "mssql":
         from sqlalchemy.dialects import mssql  # noqa: PLC0415
 
+        if pa.types.is_boolean(arrow_type):
+            return mssql.BIT()
+        if pa.types.is_int8(arrow_type) or pa.types.is_int16(arrow_type):
+            return mssql.SMALLINT()
+        if pa.types.is_int32(arrow_type):
+            return mssql.INTEGER()
+        if pa.types.is_int64(arrow_type):
+            return mssql.BIGINT()
+        if pa.types.is_float32(arrow_type):
+            return mssql.REAL()
+        if pa.types.is_float64(arrow_type):
+            return mssql.FLOAT(precision=53)
+        if pa.types.is_decimal(arrow_type):
+            return mssql.DECIMAL(precision=arrow_type.precision, scale=arrow_type.scale)
+        if pa.types.is_date(arrow_type):
+            return mssql.DATE()
+        if pa.types.is_timestamp(arrow_type):
+            return mssql.DATETIME()
         if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
             return mssql.NVARCHAR(None)
         if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
             return mssql.VARBINARY(None)
-        if pa.types.is_timestamp(arrow_type) and arrow_type.tz is None:
-            return mssql.DATETIME2()
+        msg = f"Spark JDBC does not support automatic SQL Server table creation for Arrow type {arrow_type}."
+        raise TypeError(msg)
 
     if pa.types.is_boolean(arrow_type):
         return sa.Boolean()
@@ -752,9 +794,43 @@ def _arrow_to_sqlalchemy_type(arrow_type: pa.DataType, dialect: str | None = Non
         return sa.Time()
     if pa.types.is_timestamp(arrow_type):
         return sa.DateTime(timezone=arrow_type.tz is not None)
-    if pa.types.is_dictionary(arrow_type):
-        return _arrow_to_sqlalchemy_type(arrow_type.value_type, dialect)
-    return sa.Text()
+    msg = f"No automatic JDBC table-creation mapping for Arrow type {arrow_type}."
+    raise TypeError(msg)
+
+
+def _validate_pg_create_schema(schema: pa.Schema) -> None:
+    """Reject Arrow types outside Spark 4.1's PostgreSQL creation matrix."""
+
+    def supported(data_type: pa.DataType) -> bool:
+        if pa.types.is_list(data_type) or pa.types.is_large_list(data_type):
+            return supported(data_type.value_type)
+        return any(
+            predicate(data_type)
+            for predicate in (
+                pa.types.is_boolean,
+                pa.types.is_int8,
+                pa.types.is_int16,
+                pa.types.is_int32,
+                pa.types.is_int64,
+                pa.types.is_float32,
+                pa.types.is_float64,
+                pa.types.is_decimal,
+                pa.types.is_date,
+                pa.types.is_timestamp,
+                pa.types.is_string,
+                pa.types.is_large_string,
+                pa.types.is_binary,
+                pa.types.is_large_binary,
+            )
+        )
+
+    for field in schema:
+        if not supported(field.type):
+            msg = (
+                "Spark JDBC does not support automatic PostgreSQL table creation "
+                f"for column {field.name!r} with Arrow type {field.type}."
+            )
+            raise TypeError(msg)
 
 
 def _pg_table_exists(dsn: str, dbtable: str) -> bool:
@@ -765,6 +841,29 @@ def _pg_table_exists(dsn: str, dbtable: str) -> bool:
         return cur.fetchone()[0] is not None  # type: ignore[index]
 
 
+def _resolve_column_names(source: list[str], target: list[str], *, case_sensitive: bool = False) -> list[str]:
+    """Resolve source columns to target spelling using Spark's name-based rules."""
+    resolved: list[str] = []
+    for name in source:
+        matches = [candidate for candidate in target if candidate == name]
+        if not case_sensitive and not matches:
+            matches = [candidate for candidate in target if candidate.casefold() == name.casefold()]
+        if len(matches) != 1:
+            msg = f"Column {name!r} cannot be resolved uniquely in target schema {target!r}."
+            raise ValueError(msg)
+        resolved.append(matches[0])
+    return resolved
+
+
+def _pg_target_columns(dsn: str, dbtable: str) -> list[str]:
+    import psycopg  # noqa: PLC0415
+
+    with psycopg.connect(dsn) as conn, conn.cursor() as cur:
+        # Identifiers are parsed and quoted by _quote_qualified; query values are not interpolated.
+        cur.execute(f"SELECT * FROM {_quote_qualified(dbtable)} LIMIT 0")  # noqa: S608
+        return [column.name for column in cur.description or ()]
+
+
 def _sqlalchemy_table_exists(url: str, connect_args: dict, dbtable: str) -> bool:
     import sqlalchemy as sa  # noqa: PLC0415
     from sqlalchemy import NullPool  # noqa: PLC0415
@@ -773,6 +872,18 @@ def _sqlalchemy_table_exists(url: str, connect_args: dict, dbtable: str) -> bool
     engine = sa.create_engine(url, connect_args=connect_args, poolclass=NullPool)
     try:
         return sa.inspect(engine).has_table(table, schema=schema)
+    finally:
+        engine.dispose()
+
+
+def _sqlalchemy_target_columns(url: str, connect_args: dict, dbtable: str) -> list[str]:
+    import sqlalchemy as sa  # noqa: PLC0415
+    from sqlalchemy import NullPool  # noqa: PLC0415
+
+    schema, table = _split_schema(dbtable)
+    engine = sa.create_engine(url, connect_args=connect_args, poolclass=NullPool)
+    try:
+        return [column["name"] for column in sa.inspect(engine).get_columns(table, schema=schema)]
     finally:
         engine.dispose()
 
@@ -794,6 +905,13 @@ def _drop_pg_table(dsn: str, dbtable: str) -> None:
 
     with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(f"DROP TABLE {_quote_qualified(dbtable)}")
+
+
+def _truncate_pg_table(dsn: str, dbtable: str) -> None:
+    import psycopg  # noqa: PLC0415
+
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f"TRUNCATE TABLE {_quote_qualified(dbtable)}")
 
 
 def _create_sqlalchemy_table(url: str, connect_args: dict, dbtable: str, schema: pa.Schema) -> None:
@@ -857,6 +975,7 @@ class SqlAlchemyWriteEngine:
         batch_size: int,
         run_id: str,
         connect_args: dict | None = None,
+        case_sensitive: bool = False,
     ) -> None:
         if batch_size <= 0:
             msg = f"batch_size must be a positive integer, got {batch_size}."
@@ -868,6 +987,7 @@ class SqlAlchemyWriteEngine:
         self.batch_size = batch_size
         self.run_id = run_id
         self.connect_args = connect_args or {}
+        self.case_sensitive = case_sensitive
         self.schema, self.table = _split_schema(dbtable)
 
     def _create_engine(self):
@@ -900,6 +1020,12 @@ class SqlAlchemyWriteEngine:
 
         if table_obj.num_rows == 0:
             return
+        resolved = _resolve_column_names(
+            table_obj.column_names,
+            [column.name for column in sa_table.columns],
+            case_sensitive=self.case_sensitive,
+        )
+        table_obj = table_obj.rename_columns(resolved)
         with engine.begin() as conn:
             for chunk in _iter_arrow_chunks(table_obj, self.batch_size):
                 conn.execute(sa.insert(sa_table), chunk.to_pylist())
@@ -1034,36 +1160,68 @@ class _ArrowWriter(DataSourceArrowWriter):
         self._engine.abort([m.result for m in messages if isinstance(m, _JdbcCommitMessage)])
 
 
-class _NoopArrowWriter(DataSourceArrowWriter):
-    """Marker writer used when ``ignore`` sees an existing JDBC target."""
-
-    _sail_skip_write = True
-
-    def write(self, iterator: Iterator[pa.RecordBatch]) -> WriterCommitMessage:  # noqa: ARG002
-        return _JdbcCommitMessage(PartitionResult(0, 0, None))
-
-    def commit(self, messages: list[WriterCommitMessage]) -> None:  # noqa: ARG002
-        return None
-
-    def abort(self, messages: list[WriterCommitMessage]) -> None:  # noqa: ARG002
-        return None
-
-
 class JdbcDataSourceWriter(_ArrowWriter):
     """PostgreSQL ADBC writer (kept as a named class for backward compatibility)."""
 
     def __init__(
-        self, *, conn_str: str, dbtable: str, overwrite_mode: str, batch_size: int, run_id: str | None = None
+        self,
+        *,
+        conn_str: str,
+        dbtable: str,
+        schema: pa.Schema,
+        save_mode: str,
+        overwrite_mode: str,
+        batch_size: int,
+        case_sensitive: bool,
+        run_id: str | None = None,
     ) -> None:
+        self._conn_str = conn_str
+        self._dbtable = dbtable
+        self._schema = schema
+        self._save_mode = save_mode
+        self._overwrite_mode = overwrite_mode
+        self._case_sensitive = case_sensitive
         super().__init__(
             PgWriteEngine(
                 dsn=conn_str,
                 dbtable=dbtable,
-                overwrite_mode=overwrite_mode,
+                overwrite_mode="atomic" if overwrite_mode == "atomic" else "append",
                 batch_size=batch_size,
                 run_id=run_id,
+                case_sensitive=case_sensitive,
             )
         )
+
+    def _sail_prepare(self) -> str:
+        try:
+            exists = _pg_table_exists(self._conn_str, self._dbtable)
+            if self._save_mode == "errorifexists" and exists:
+                msg = f"Target table {self._dbtable!r} already exists."
+                raise ValueError(msg)  # noqa: TRY301
+            if self._save_mode == "ignore" and exists:
+                return "skip"
+
+            if not exists:
+                _validate_pg_create_schema(self._schema)
+                _create_pg_table(self._conn_str, self._dbtable, self._schema)
+            elif self._save_mode == "overwrite" and self._overwrite_mode == "spark":
+                _validate_pg_create_schema(self._schema)
+                _drop_pg_table(self._conn_str, self._dbtable)
+                _create_pg_table(self._conn_str, self._dbtable, self._schema)
+            else:
+                _resolve_column_names(
+                    list(self._schema.names),
+                    _pg_target_columns(self._conn_str, self._dbtable),
+                    case_sensitive=self._case_sensitive,
+                )
+                if self._save_mode == "overwrite" and self._overwrite_mode == "truncate":
+                    _truncate_pg_table(self._conn_str, self._dbtable)
+            return "write"  # noqa: TRY300
+        except Exception as e:
+            if isinstance(e, (TypeError, ValueError)):
+                raise
+            msg = f"JDBC write preparation failed for {self._dbtable!r}: {_safe_error(e, self._conn_str)}"
+            raise RuntimeError(msg) from e
 
 
 class SqlAlchemyDataSourceWriter(_ArrowWriter):
@@ -1074,12 +1232,25 @@ class SqlAlchemyDataSourceWriter(_ArrowWriter):
         *,
         url: str,
         dbtable: str,
+        schema: pa.Schema,
+        dialect: str,
+        save_mode: str,
+        truncate: bool,
+        case_sensitive: bool,
         columns: list[str],
         overwrite: bool,
         batch_size: int,
         run_id: str,
         connect_args: dict | None = None,
     ) -> None:
+        self._url = url
+        self._dbtable = dbtable
+        self._schema = schema
+        self._dialect = dialect
+        self._save_mode = save_mode
+        self._truncate = truncate
+        self._case_sensitive = case_sensitive
+        self._connect_args = connect_args or {}
         super().__init__(
             SqlAlchemyWriteEngine(
                 url=url,
@@ -1089,8 +1260,52 @@ class SqlAlchemyDataSourceWriter(_ArrowWriter):
                 batch_size=batch_size,
                 run_id=run_id,
                 connect_args=connect_args,
+                case_sensitive=case_sensitive,
             )
         )
+
+    def _sail_prepare(self) -> str:
+        try:
+            exists = _sqlalchemy_table_exists(self._url, self._connect_args, self._dbtable)
+            if self._save_mode == "errorifexists" and exists:
+                msg = f"Target table {self._dbtable!r} already exists."
+                raise ValueError(msg)  # noqa: TRY301
+            if self._save_mode == "ignore" and exists:
+                return "skip"
+
+            if not exists:
+                for field in self._schema:
+                    _arrow_to_sqlalchemy_type(field.type, self._dialect)
+                _create_sqlalchemy_table(self._url, self._connect_args, self._dbtable, self._schema)
+            elif self._save_mode == "overwrite":
+                if self._truncate:
+                    _resolve_column_names(
+                        list(self._schema.names),
+                        _sqlalchemy_target_columns(self._url, self._connect_args, self._dbtable),
+                        case_sensitive=self._case_sensitive,
+                    )
+                _reset_sqlalchemy_table(
+                    self._url,
+                    self._connect_args,
+                    self._dbtable,
+                    truncate=self._truncate,
+                )
+                if not self._truncate:
+                    for field in self._schema:
+                        _arrow_to_sqlalchemy_type(field.type, self._dialect)
+                    _create_sqlalchemy_table(self._url, self._connect_args, self._dbtable, self._schema)
+            else:
+                _resolve_column_names(
+                    list(self._schema.names),
+                    _sqlalchemy_target_columns(self._url, self._connect_args, self._dbtable),
+                    case_sensitive=self._case_sensitive,
+                )
+            return "write"  # noqa: TRY300
+        except Exception as e:
+            if isinstance(e, (TypeError, ValueError)):
+                raise
+            msg = f"JDBC write preparation failed for {self._dbtable!r}: {_safe_error(e, self._url)}"
+            raise RuntimeError(msg) from e
 
 
 # ============================================================================
@@ -1169,7 +1384,7 @@ class JdbcDataSource(DataSource):
     # ------------------------------------------------------------------
 
     def _resolve_options(self) -> dict:
-        opts = self.options
+        opts = {key.lower(): value for key, value in self.options.items()}
 
         # --- url ---
         url = opts.get("url")
@@ -1201,10 +1416,10 @@ class JdbcDataSource(DataSource):
         conn_str = _jdbc_url_to_dsn(url, user, password)
 
         # --- partitioning ---
-        num_partitions = int(opts.get("numPartitions", "1"))
-        partition_column = opts.get("partitionColumn") or None
-        lower_bound_raw = opts.get("lowerBound") or None
-        upper_bound_raw = opts.get("upperBound") or None
+        num_partitions = int(opts.get("numpartitions", "1"))
+        partition_column = opts.get("partitioncolumn") or None
+        lower_bound_raw = opts.get("lowerbound") or None
+        upper_bound_raw = opts.get("upperbound") or None
 
         partition_opts_present = sum(v is not None for v in [partition_column, lower_bound_raw, upper_bound_raw])
 
@@ -1250,7 +1465,7 @@ class JdbcDataSource(DataSource):
             msg = f"'lowerBound' ({lower_bound}) must be strictly less than 'upperBound' ({upper_bound})."
             raise ValueError(msg)
 
-        push_down_predicate = opts.get("pushDownPredicate", "true").lower() == "true"
+        push_down_predicate = opts.get("pushdownpredicate", "true").lower() == "true"
 
         return {
             "conn_str": conn_str,
@@ -1287,7 +1502,8 @@ class JdbcDataSource(DataSource):
 
         inferred = table.schema
 
-        custom_schema_ddl = self.options.get("customSchema") or None
+        opts = {key.lower(): value for key, value in self.options.items()}
+        custom_schema_ddl = opts.get("customschema") or None
         if custom_schema_ddl:
             inferred = _apply_custom_schema(inferred, custom_schema_ddl)
 
@@ -1316,8 +1532,8 @@ class JdbcDataSource(DataSource):
         * ``user`` / ``password`` — optional credentials
         * ``batchsize`` — rows per ingest call (default 65 536)
         * ``truncate`` — Spark-compatible truncate request (MySQL / SQL Server)
-        * ``overwriteMode`` — ``"spark"`` (default), ``"atomic"``, or ``"truncate"``;
-          PostgreSQL only, consulted when *overwrite* is ``True``
+        * ``sail.jdbc.overwriteMode`` — ``"atomic"`` or ``"truncate"``;
+          PostgreSQL-only Sail extension for explicit overwrite mode
 
         Usage::
 
@@ -1327,7 +1543,7 @@ class JdbcDataSource(DataSource):
                 .mode("overwrite") \\
                 .save()
         """
-        opts = self.options
+        opts = {key.lower(): value for key, value in self.options.items()}
 
         url = opts.get("url")
         if not url:
@@ -1356,67 +1572,54 @@ class JdbcDataSource(DataSource):
 
         run_id = uuid.uuid4().hex[:12]
         save_mode = opts.get("__sail_save_mode", "overwrite" if overwrite else "append").lower()
+        if save_mode not in {"errorifexists", "ignore", "append", "overwrite"}:
+            msg = f"Unsupported JDBC save mode {save_mode!r}."
+            raise ValueError(msg)
         truncate_value = opts.get("truncate", "false").lower()
         if truncate_value not in {"true", "false"}:
             msg = f"Option 'truncate' must be 'true' or 'false', got {truncate_value!r}."
             raise ValueError(msg)
         truncate_requested = truncate_value == "true"
+        case_sensitive = opts.get("__sail_case_sensitive", "false").lower() == "true"
+        sail_overwrite_mode = opts.get("sail.jdbc.overwritemode")
+        if sail_overwrite_mode is not None:
+            sail_overwrite_mode = sail_overwrite_mode.lower()
+            if save_mode != "overwrite":
+                msg = "Option 'sail.jdbc.overwriteMode' requires mode('overwrite')."
+                raise ValueError(msg)
+            if subprotocol != "postgresql":
+                msg = "Option 'sail.jdbc.overwriteMode' is supported only for PostgreSQL."
+                raise ValueError(msg)
+            if sail_overwrite_mode not in {"atomic", "truncate"}:
+                msg = f"Option 'sail.jdbc.overwriteMode' must be 'atomic' or 'truncate', got {sail_overwrite_mode!r}."
+                raise ValueError(msg)
+            if truncate_requested:
+                msg = "Options 'truncate' and 'sail.jdbc.overwriteMode' cannot be combined."
+                raise ValueError(msg)
 
         if subprotocol == "postgresql":
-            if overwrite:
-                overwrite_mode = opts.get("overwriteMode", "spark")
-                valid = {"spark", "atomic", "truncate"}
-                if overwrite_mode not in valid:
-                    msg = f"Invalid overwriteMode {overwrite_mode!r}. Valid values: {sorted(valid)}"
-                    raise ValueError(msg)
-            else:
-                overwrite_mode = "append"
-
-            exists = _pg_table_exists(conn_str, dbtable)
-            if save_mode == "errorifexists" and exists:
-                msg = f"Target table {dbtable!r} already exists."
-                raise ValueError(msg)
-            if save_mode == "ignore" and exists:
-                return _NoopArrowWriter()
-
-            # Spark's PostgreSQL dialect ignores truncate=true and drops/recreates.
-            if exists and overwrite_mode == "spark":
-                _drop_pg_table(conn_str, dbtable)
-                exists = False
-                overwrite_mode = "append"
-            if not exists:
-                _create_pg_table(conn_str, dbtable, schema)
+            overwrite_mode = sail_overwrite_mode or ("spark" if overwrite else "append")
             return JdbcDataSourceWriter(
                 conn_str=conn_str,
                 dbtable=dbtable,
+                schema=schema,
+                save_mode=save_mode,
                 overwrite_mode=overwrite_mode,
                 batch_size=batch_size,
+                case_sensitive=case_sensitive,
                 run_id=run_id,
             )
 
         if subprotocol in ("mysql", "sqlserver"):
             sa_url, connect_args = _sqlalchemy_url(conn_str)
-            exists = _sqlalchemy_table_exists(sa_url, connect_args, dbtable)
-            if save_mode == "errorifexists" and exists:
-                msg = f"Target table {dbtable!r} already exists."
-                raise ValueError(msg)
-            if save_mode == "ignore" and exists:
-                return _NoopArrowWriter()
-
-            if overwrite and exists:
-                _reset_sqlalchemy_table(
-                    sa_url,
-                    connect_args,
-                    dbtable,
-                    truncate=truncate_requested,
-                )
-                if not truncate_requested:
-                    exists = False
-            if not exists:
-                _create_sqlalchemy_table(sa_url, connect_args, dbtable, schema)
             return SqlAlchemyDataSourceWriter(
                 url=sa_url,
                 dbtable=dbtable,
+                schema=schema,
+                dialect="mysql" if subprotocol == "mysql" else "mssql",
+                save_mode=save_mode,
+                truncate=overwrite and truncate_requested,
+                case_sensitive=case_sensitive,
                 columns=list(schema.names),
                 overwrite=False,
                 batch_size=batch_size,

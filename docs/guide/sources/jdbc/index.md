@@ -200,14 +200,14 @@ ignored.
   SQL Server, `truncate=true` truncates instead, preserving the table schema and
   metadata. Spark's PostgreSQL dialect does not support this optimization, so
   PostgreSQL ignores `truncate=true` and still drops/recreates.
-  - PostgreSQL also supports the Sail extension `overwriteMode=atomic`, which loads all
+  - PostgreSQL also supports the Sail extension `sail.jdbc.overwriteMode=atomic`, which loads all
     partitions into one staging table, then swaps it over the target in a single
     `DROP; RENAME` transaction (replaces the table object, so grants/ACLs/RLS are
     **not** preserved); the target is never left partially written. It is, however,
     **at-least-once** under Spark task retry / speculative execution — a re-run
     partition re-ingests into the shared staging, so the swapped-in table can contain
     duplicates (same as `append`); disable speculation for exactly-once overwrite.
-    `overwriteMode=truncate`
+    `sail.jdbc.overwriteMode=truncate`
     `TRUNCATE`s the target once then ingests directly, preserving the table object
     but **non-atomically**. These extension modes intentionally differ from Spark
     and must be requested explicitly.
@@ -217,16 +217,16 @@ Concurrent overwrites to the same table are **not supported**. Two overwrite job
 running at once can interleave and leave a mixed result; Spark's own JDBC writer
 takes no lock and gives the same non-guarantee. Run overwrites one at a time.
 
-A failed cleanup can leave orphan `*__sail_stg_*` (and, for PostgreSQL truncate
-mode, `*__sail_trunc_*`) tables behind. They are safe to drop manually.
+A failed atomic-overwrite cleanup can leave orphan `*__sail_stg_*` tables behind.
+They are safe to drop manually.
 :::
 
-| Write option    | Default  | Description                                        |
-| --------------- | -------- | -------------------------------------------------- |
-| `dbtable`       |          | Target table (required; `query` not allowed)       |
-| `truncate`      | `false`  | Preserve table on MySQL/SQL Server overwrite      |
-| `overwriteMode` | `spark`  | `spark`, `atomic`, or `truncate` (PostgreSQL only) |
-| `batchsize`     | `65536`  | Rows per ingest call                               |
+| Write option              | Default | Description                                        |
+| ------------------------- | ------- | -------------------------------------------------- |
+| `dbtable`                 |         | Target table (required; `query` not allowed)       |
+| `truncate`                | `false` | Preserve table on MySQL/SQL Server overwrite       |
+| `sail.jdbc.overwriteMode` | —       | `atomic` or `truncate` (PostgreSQL overwrite only) |
+| `batchsize`               | `65536` | Rows per ingest call                               |
 
 In explicit `append` or `overwrite` mode, a missing target is created from the
 DataFrame schema. PySpark's Python data-source API currently rejects the default

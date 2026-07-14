@@ -34,6 +34,9 @@ def stub_target_exists(monkeypatch):
     monkeypatch.setattr(jdbc_mod, "_reset_sqlalchemy_table", lambda *_a, **_k: None)
     monkeypatch.setattr(jdbc_mod, "_create_pg_table", lambda *_a, **_k: None)
     monkeypatch.setattr(jdbc_mod, "_create_sqlalchemy_table", lambda *_a, **_k: None)
+    monkeypatch.setattr(jdbc_mod, "_truncate_pg_table", lambda *_a, **_k: None)
+    monkeypatch.setattr(jdbc_mod, "_pg_target_columns", lambda *_a, **_k: ["id"])
+    monkeypatch.setattr(jdbc_mod, "_sqlalchemy_target_columns", lambda *_a, **_k: ["id"])
 
 
 # ---------------------------------------------------------------------------
@@ -257,12 +260,18 @@ def test_arrow_to_sqlalchemy_type_mapping():
     assert (decimal.precision, decimal.scale) == (18, 3)
 
     assert str(_arrow_to_sqlalchemy_type(pa.string(), "mysql")) == "LONGTEXT"
-    assert str(_arrow_to_sqlalchemy_type(pa.binary(), "mysql")) == "LONGBLOB"
+    assert str(_arrow_to_sqlalchemy_type(pa.binary(), "mysql")) == "BLOB"
 
     from sqlalchemy.dialects import mssql
 
     assert _arrow_to_sqlalchemy_type(pa.string(), "mssql").compile(dialect=mssql.dialect()) == "NVARCHAR(max)"
     assert _arrow_to_sqlalchemy_type(pa.binary(), "mssql").compile(dialect=mssql.dialect()) == "VARBINARY(max)"
+    assert _arrow_to_sqlalchemy_type(pa.timestamp("us"), "mssql").compile(dialect=mssql.dialect()) == "DATETIME"
+
+    with pytest.raises(TypeError, match="does not support"):
+        _arrow_to_sqlalchemy_type(pa.list_(pa.int32()), "mysql")
+    with pytest.raises(TypeError, match="does not support"):
+        _arrow_to_sqlalchemy_type(pa.struct([("x", pa.int32())]), "mssql")
 
 
 @pytest.mark.parametrize("bad", ["0", "-1"])
@@ -513,16 +522,62 @@ def test_pg_write_engine_staging_name():
 
 @pytest.mark.usefixtures("stub_target_exists")
 def test_overwrite_mode_default_matches_spark():
-    """Default overwrite drops/recreates before returning an append writer."""
-    from pyspark.sql.types import IntegerType, StructField, StructType
+    """Default overwrite prepares drop/recreate only when execution starts."""
+    import pyarrow as pa
 
     from pysail.spark.datasource.jdbc import JdbcDataSource, JdbcDataSourceWriter
 
-    schema = StructType([StructField("id", IntegerType())])
+    schema = pa.schema([("id", pa.int32())])
     ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "t"})
     writer = ds.writer(schema, overwrite=True)
     assert isinstance(writer, JdbcDataSourceWriter)
     assert writer._engine.overwrite_mode == "append"  # noqa: SLF001
+
+
+def test_writer_construction_is_database_side_effect_free(monkeypatch):
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    calls = []
+    monkeypatch.setattr(jdbc, "_pg_table_exists", lambda *_a, **_k: calls.append("exists") or True)
+    monkeypatch.setattr(jdbc, "_drop_pg_table", lambda *_a, **_k: calls.append("drop"))
+    monkeypatch.setattr(jdbc, "_create_pg_table", lambda *_a, **_k: calls.append("create"))
+    ds = jdbc.JdbcDataSource(
+        options={
+            "URL": "jdbc:postgresql://localhost:5432/db",
+            "DBTABLE": "t",
+            "__sail_save_mode": "overwrite",
+        }
+    )
+    writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=True)
+    assert calls == []
+    assert writer._sail_prepare() == "write"  # noqa: SLF001
+    assert calls == ["exists", "drop", "create"]
+
+
+def test_column_resolution_matches_spark_names():
+    from pysail.spark.datasource.jdbc import _resolve_column_names
+
+    assert _resolve_column_names(["id", "displayname"], ["ID", "DisplayName", "extra"]) == ["ID", "DisplayName"]
+    with pytest.raises(ValueError, match="missing"):
+        _resolve_column_names(["missing"], ["id"])
+    with pytest.raises(ValueError, match="uniquely"):
+        _resolve_column_names(["Id"], ["ID", "id"])
+
+
+def test_unsupported_type_fails_after_missing_target_check(monkeypatch):
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    calls = []
+    monkeypatch.setattr(jdbc, "_sqlalchemy_table_exists", lambda *_a, **_k: calls.append("exists") or False)
+    ds = jdbc.JdbcDataSource(options={"url": "jdbc:mysql://localhost/db", "dbtable": "t", "__sail_save_mode": "append"})
+    writer = ds.writer(pa.schema([("payload", pa.list_(pa.int32()))]), overwrite=False)
+    with pytest.raises(TypeError, match="does not support"):
+        writer._sail_prepare()  # noqa: SLF001
+    assert calls == ["exists"]
 
 
 @pytest.mark.usefixtures("stub_target_exists")
@@ -539,8 +594,9 @@ def test_errorifexists_rejects_existing_target():
             "__sail_save_mode": "errorifexists",
         }
     )
+    writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
     with pytest.raises(ValueError, match="already exists"):
-        ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
+        writer._sail_prepare()  # noqa: SLF001
 
 
 @pytest.mark.usefixtures("stub_target_exists")
@@ -558,7 +614,7 @@ def test_ignore_existing_target_returns_skip_writer():
         }
     )
     writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
-    assert writer._sail_skip_write is True  # noqa: SLF001
+    assert writer._sail_prepare() == "skip"  # noqa: SLF001
 
 
 def test_sqlalchemy_truncate_option_preserves_target(monkeypatch):
@@ -569,6 +625,7 @@ def test_sqlalchemy_truncate_option_preserves_target(monkeypatch):
 
     reset = []
     monkeypatch.setattr(jdbc, "_sqlalchemy_table_exists", lambda *_a, **_k: True)
+    monkeypatch.setattr(jdbc, "_sqlalchemy_target_columns", lambda *_a, **_k: ["id"])
     monkeypatch.setattr(jdbc, "_reset_sqlalchemy_table", lambda *_a, **k: reset.append(k["truncate"]))
     ds = jdbc.JdbcDataSource(
         options={
@@ -579,6 +636,8 @@ def test_sqlalchemy_truncate_option_preserves_target(monkeypatch):
         }
     )
     writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=True)
+    assert reset == []
+    assert writer._sail_prepare() == "write"  # noqa: SLF001
     assert reset == [True]
     assert writer._engine.overwrite is False  # noqa: SLF001
 
@@ -596,31 +655,67 @@ def test_truncate_option_rejects_non_boolean():
 
 @pytest.mark.usefixtures("stub_target_exists")
 def test_overwrite_mode_truncate_valid():
-    """overwriteMode='truncate' is accepted."""
-    from pyspark.sql.types import IntegerType, StructField, StructType
+    """The namespaced PostgreSQL truncate extension is accepted."""
+    import pyarrow as pa
 
     from pysail.spark.datasource.jdbc import JdbcDataSource
 
-    schema = StructType([StructField("id", IntegerType())])
+    schema = pa.schema([("id", pa.int32())])
     ds = JdbcDataSource(
-        options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "t", "overwriteMode": "truncate"}
+        options={
+            "url": "jdbc:postgresql://localhost:5432/db",
+            "dbtable": "t",
+            "__sail_save_mode": "overwrite",
+            "sail.jdbc.overwriteMode": "truncate",
+        }
     )
     writer = ds.writer(schema, overwrite=True)
-    assert writer._engine.overwrite_mode == "truncate"  # noqa: SLF001
+    assert writer._engine.overwrite_mode == "append"  # noqa: SLF001
+    assert writer._sail_prepare() == "write"  # noqa: SLF001
 
 
 def test_overwrite_mode_invalid_raises():
-    """Unknown overwriteMode raises ValueError."""
-    from pyspark.sql.types import IntegerType, StructField, StructType
+    """Unknown namespaced overwrite mode raises before database access."""
+    import pyarrow as pa
 
     from pysail.spark.datasource.jdbc import JdbcDataSource
 
-    schema = StructType([StructField("id", IntegerType())])
+    schema = pa.schema([("id", pa.int32())])
     ds = JdbcDataSource(
-        options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "t", "overwriteMode": "badmode"}
+        options={
+            "url": "jdbc:postgresql://localhost:5432/db",
+            "dbtable": "t",
+            "__sail_save_mode": "overwrite",
+            "sail.jdbc.overwriteMode": "badmode",
+        }
     )
     with pytest.raises(ValueError, match="badmode"):
         ds.writer(schema, overwrite=True)
+
+
+@pytest.mark.parametrize(
+    ("options", "overwrite", "match"),
+    [
+        ({"sail.jdbc.overwriteMode": "atomic"}, False, "requires"),
+        ({"sail.jdbc.overwriteMode": "atomic", "truncate": "true"}, True, "cannot be combined"),
+    ],
+)
+def test_namespaced_overwrite_mode_rejects_invalid_combinations(options, overwrite, match):
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    save_mode = "overwrite" if overwrite else "append"
+    ds = JdbcDataSource(
+        options={
+            "URL": "jdbc:postgresql://localhost:5432/db",
+            "DBTABLE": "t",
+            "__sail_save_mode": save_mode,
+            **options,
+        }
+    )
+    with pytest.raises(ValueError, match=match):
+        ds.writer(pa.schema([("id", pa.int32())]), overwrite=overwrite)
 
 
 def test_staging_name_atomic_run_id_suffix():

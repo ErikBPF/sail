@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from testcontainers.postgres import PostgresContainer
 
+from pysail.testing.spark.jdbc_oracle import native_spark_4_1_2_python, run_native_jdbc_write
 from pysail.testing.spark.utils.common import pyspark_version
 
 pytestmark = pytest.mark.integration
@@ -651,6 +652,92 @@ def test_write_creates_missing_target(spark, jdbc_opts, pg_dsn, mode):
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
 
 
+def test_postgres_created_types_match_spark_4_1(spark, jdbc_opts, pg_dsn):
+    import datetime as dt
+
+    import psycopg
+    from pyspark.sql.types import BinaryType, BooleanType, StringType, StructField, StructType, TimestampType
+
+    table = "wt_pg_spark_types"
+    schema = StructType(
+        [
+            StructField("flag", BooleanType()),
+            StructField("payload", BinaryType()),
+            StructField("created_at", TimestampType()),
+            StructField("label", StringType()),
+        ]
+    )
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+    try:
+        spark.createDataFrame([(True, b"x", dt.datetime(2026, 1, 2, 3, 4, 5), "ok")], schema).write.format(  # noqa: DTZ001
+            "jdbc"
+        ).option("DBTABLE", table).options(**{key.upper(): value for key, value in jdbc_opts.items()}).mode(
+            "append"
+        ).save()
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = %s ORDER BY ordinal_position",
+                (table,),
+            )
+            assert dict(cur.fetchall()) == {
+                "flag": "boolean",
+                "payload": "bytea",
+                "created_at": "timestamp with time zone",
+                "label": "text",
+            }
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_write_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    import psycopg
+    from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
+
+    native_table = "wt_pg_native_oracle"
+    sail_table = "wt_pg_sail_oracle"
+    schema = StructType(
+        [StructField("id", IntegerType()), StructField("name", StringType()), StructField("score", DoubleType())]
+    )
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+    try:
+        rows = [[1, "Alice", 9.5], [2, "Bob", 7.2]]
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=native_table,
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode="append",
+        )
+        spark.createDataFrame([tuple(row) for row in rows], schema).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).options(**jdbc_opts).mode("append").save()
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            snapshots = []
+            for table in (native_table, sail_table):
+                cur.execute(
+                    "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+                    "WHERE table_name = %s ORDER BY ordinal_position",
+                    (table,),
+                )
+                columns = cur.fetchall()
+                cur.execute(f'SELECT id, name, score FROM "{table}" ORDER BY id')  # noqa: S608
+                snapshots.append((columns, cur.fetchall()))
+            assert snapshots[0] == snapshots[1]
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+
+
 @pytest.mark.parametrize("write_table", ["wt_default_mode"], indirect=True)
 def test_write_default_mode_rejects_existing_target(spark, jdbc_opts, write_table):
     """Spark's default errorIfExists mode must not silently append."""
@@ -676,6 +763,13 @@ def test_write_ignore_preserves_existing_target(spark, jdbc_opts, pg_dsn, write_
 
     result = _read_pg_table(spark, jdbc_opts, write_table)
     assert [(r.id, r.name) for r in result.collect()] == [(99, "old")]
+
+
+@pytest.mark.parametrize("write_table", ["wt_ignore_no_eval"], indirect=True)
+def test_write_ignore_does_not_evaluate_input(spark, jdbc_opts, write_table):
+    """Execution preparation returns skip before the failing input is polled."""
+    df = spark.range(1).selectExpr("raise_error('ignore evaluated input') AS id")
+    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("ignore").save()
 
 
 @pytest.mark.parametrize("write_table", ["wt_schema_replace"], indirect=True)
@@ -840,7 +934,7 @@ def test_write_overwrite_atomic_replaces(spark, jdbc_opts, write_table):
     first.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("append").save()
     assert _read_pg_table(spark, jdbc_opts, write_table).count() == 2  # noqa: PLR2004
 
-    second.write.format("jdbc").option("dbtable", write_table).option("overwriteMode", "atomic").options(
+    second.write.format("jdbc").option("dbtable", write_table).option("sail.jdbc.overwriteMode", "atomic").options(
         **jdbc_opts
     ).mode("overwrite").save()
 
@@ -863,9 +957,9 @@ def test_write_overwrite_atomic_serial_sequence(spark, jdbc_opts, pg_dsn, serial
     second = spark.createDataFrame([(10, "Charlie"), (11, "Dave")], schema)
 
     first.write.format("jdbc").option("dbtable", serial_write_table).options(**jdbc_opts).mode("append").save()
-    second.write.format("jdbc").option("dbtable", serial_write_table).option("overwriteMode", "atomic").options(
-        **jdbc_opts
-    ).mode("overwrite").save()
+    second.write.format("jdbc").option("dbtable", serial_write_table).option(
+        "sail.jdbc.overwriteMode", "atomic"
+    ).options(**jdbc_opts).mode("overwrite").save()
 
     result = _read_pg_table(spark, jdbc_opts, serial_write_table)
     assert sorted(r.name for r in result.collect()) == ["Charlie", "Dave"]
@@ -895,7 +989,7 @@ def test_write_overwrite_truncate_replaces(spark, jdbc_opts, write_table):
     first.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("append").save()
     assert _read_pg_table(spark, jdbc_opts, write_table).count() == 2  # noqa: PLR2004
 
-    second.write.format("jdbc").option("dbtable", write_table).option("overwriteMode", "truncate").options(
+    second.write.format("jdbc").option("dbtable", write_table).option("sail.jdbc.overwriteMode", "truncate").options(
         **jdbc_opts
     ).mode("overwrite").save()
 
@@ -923,7 +1017,7 @@ def test_write_atomic_empty_df(spark, jdbc_opts, write_table):
 
     # Overwrite with empty
     empty_df = spark.createDataFrame([], schema)
-    empty_df.write.format("jdbc").option("dbtable", write_table).option("overwriteMode", "atomic").options(
+    empty_df.write.format("jdbc").option("dbtable", write_table).option("sail.jdbc.overwriteMode", "atomic").options(
         **jdbc_opts
     ).mode("overwrite").save()
 
@@ -944,9 +1038,9 @@ def test_write_atomic_null_values(spark, jdbc_opts, write_table):
     )
     data = [(1, None, 9.5), (2, "Bob", None)]
     df = spark.createDataFrame(data, schema)
-    df.write.format("jdbc").option("dbtable", write_table).option("overwriteMode", "atomic").options(**jdbc_opts).mode(
-        "overwrite"
-    ).save()
+    df.write.format("jdbc").option("dbtable", write_table).option("sail.jdbc.overwriteMode", "atomic").options(
+        **jdbc_opts
+    ).mode("overwrite").save()
 
     result = _read_pg_table(spark, jdbc_opts, write_table).collect()
     assert len(result) == 2  # noqa: PLR2004
@@ -1158,9 +1252,9 @@ def test_write_overwrite_atomic_schema_qualified(spark, jdbc_opts, pg_dsn, quali
     first.write.format("jdbc").option("dbtable", dbtable).options(**jdbc_opts).mode("append").save()
     assert _count_in_schema(pg_dsn, schema, table) == 2  # noqa: PLR2004
 
-    second.write.format("jdbc").option("dbtable", dbtable).option("overwriteMode", "atomic").options(**jdbc_opts).mode(
-        "overwrite"
-    ).save()
+    second.write.format("jdbc").option("dbtable", dbtable).option("sail.jdbc.overwriteMode", "atomic").options(
+        **jdbc_opts
+    ).mode("overwrite").save()
 
     assert _count_in_schema(pg_dsn, schema, table) == 1
     assert not _public_table_exists(pg_dsn, table), "atomic overwrite created a public-schema copy"
@@ -1176,7 +1270,7 @@ def test_write_overwrite_truncate_schema_qualified(spark, jdbc_opts, pg_dsn, qua
     first.write.format("jdbc").option("dbtable", dbtable).options(**jdbc_opts).mode("append").save()
     assert _count_in_schema(pg_dsn, schema, table) == 2  # noqa: PLR2004
 
-    second.write.format("jdbc").option("dbtable", dbtable).option("overwriteMode", "truncate").options(
+    second.write.format("jdbc").option("dbtable", dbtable).option("sail.jdbc.overwriteMode", "truncate").options(
         **jdbc_opts
     ).mode("overwrite").save()
 

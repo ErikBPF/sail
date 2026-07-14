@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from pysail.testing.spark.jdbc_oracle import native_spark_4_1_2_python, run_native_jdbc_write
+
 pytestmark = pytest.mark.integration
 
 try:
@@ -65,6 +67,16 @@ def _column_names(sa_url, table):
     engine = sa.create_engine(sa_url)
     try:
         return [column["name"] for column in sa.inspect(engine).get_columns(table)]
+    finally:
+        engine.dispose()
+
+
+def _column_types(sa_url, table):
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(sa_url)
+    try:
+        return {column["name"]: str(column["type"]).lower() for column in sa.inspect(engine).get_columns(table)}
     finally:
         engine.dispose()
 
@@ -161,6 +173,63 @@ def test_mysql_truncate_overwrite_preserves_schema(spark, mysql_table):
     df.write.format("jdbc").option("dbtable", table).option("truncate", "true").options(**opts).mode("overwrite").save()
     assert _column_names(sa_url, table) == ["id", "name", "score"]
     assert _count_names(sa_url, table) == (1, {"Charlie"})
+
+
+def test_mysql_created_types_match_spark_4_1(spark, mysql_ctx):
+    import datetime as dt
+
+    from pyspark.sql.types import BinaryType, BooleanType, StructField, StructType, TimestampType
+
+    opts, sa_url = mysql_ctx
+    table = "wt_mysql_spark_types"
+    _drop_table(sa_url, table)
+    try:
+        schema = StructType(
+            [
+                StructField("flag", BooleanType()),
+                StructField("payload", BinaryType()),
+                StructField("created_at", TimestampType()),
+            ]
+        )
+        spark.createDataFrame([(True, b"x", dt.datetime(2026, 1, 2, 3, 4, 5))], schema).write.format(  # noqa: DTZ001
+            "jdbc"
+        ).option("DBTABLE", table).options(**{key.upper(): value for key, value in opts.items()}).mode("append").save()
+        types = _column_types(sa_url, table)
+        assert types["flag"].startswith("bit")
+        assert types["payload"] == "blob"
+        assert types["created_at"] in {"timestamp", "datetime"}
+    finally:
+        _drop_table(sa_url, table)
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_mysql_write_matches_native_spark_4_1_2(spark, mysql_ctx):
+    opts, sa_url = mysql_ctx
+    native_table = "wt_mysql_native_oracle"
+    sail_table = "wt_mysql_sail_oracle"
+    for table in (native_table, sail_table):
+        _drop_table(sa_url, table)
+    try:
+        rows = [[1, "Alice", 9.5], [2, "Bob", 7.2]]
+        schema = _schema()
+        run_native_jdbc_write(
+            dialect="mysql",
+            jdbc_url=opts["url"],
+            dbtable=native_table,
+            user=opts["user"],
+            password=opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode="append",
+        )
+        spark.createDataFrame([tuple(row) for row in rows], schema).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).options(**opts).mode("append").save()
+        assert _column_types(sa_url, native_table) == _column_types(sa_url, sail_table)
+        assert _count_names(sa_url, native_table) == _count_names(sa_url, sail_table)
+    finally:
+        for table in (native_table, sail_table):
+            _drop_table(sa_url, table)
 
 
 # ---------------------------------------------------------------------------
@@ -337,3 +406,62 @@ def test_mssql_truncate_overwrite_preserves_schema(spark, mssql_table):
     df.write.format("jdbc").option("dbtable", table).option("truncate", "true").options(**opts).mode("overwrite").save()
     assert _column_names(sa_url, table) == ["id", "name", "score"]
     assert _count_names(sa_url, table) == (1, {"Charlie"})
+
+
+def test_mssql_created_types_match_spark_4_1(spark, mssql_ctx):
+    import datetime as dt
+
+    from pyspark.sql.types import BinaryType, BooleanType, StructField, StructType, TimestampType
+
+    opts, sa_url = mssql_ctx
+    table = "wt_mssql_spark_types"
+    _drop_table(sa_url, table)
+    try:
+        schema = StructType(
+            [
+                StructField("flag", BooleanType()),
+                StructField("payload", BinaryType()),
+                StructField("created_at", TimestampType()),
+            ]
+        )
+        spark.createDataFrame([(True, b"x", dt.datetime(2026, 1, 2, 3, 4, 5))], schema).write.format(  # noqa: DTZ001
+            "jdbc"
+        ).option("DBTABLE", table).options(**{key.upper(): value for key, value in opts.items()}).mode("append").save()
+        types = _column_types(sa_url, table)
+        assert types["flag"] == "bit"
+        # SQLAlchemy's pymssql inspector omits the MAX length marker.
+        assert types["payload"] == "varbinary"
+        assert types["created_at"] == "datetime"
+    finally:
+        _drop_table(sa_url, table)
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_mssql_write_matches_native_spark_4_1_2(spark, mssql_ctx):
+    opts, sa_url = mssql_ctx
+    native_table = "wt_mssql_native_oracle"
+    sail_table = "wt_mssql_sail_oracle"
+    for table in (native_table, sail_table):
+        _drop_table(sa_url, table)
+    try:
+        rows = [[1, "Alice", 9.5], [2, "Bob", 7.2]]
+        schema = _schema()
+        run_native_jdbc_write(
+            dialect="sqlserver",
+            jdbc_url=opts["url"],
+            dbtable=native_table,
+            user=opts["user"],
+            password=opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode="append",
+            options={"trustServerCertificate": "true"},
+        )
+        spark.createDataFrame([tuple(row) for row in rows], schema).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).options(**opts).mode("append").save()
+        assert _column_types(sa_url, native_table) == _column_types(sa_url, sail_table)
+        assert _count_names(sa_url, native_table) == _count_names(sa_url, sail_table)
+    finally:
+        for table in (native_table, sail_table):
+            _drop_table(sa_url, table)

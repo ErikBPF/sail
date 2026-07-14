@@ -275,6 +275,8 @@ pub struct SinkInfo {
     pub options: Vec<OptionLayer>,
     /// Unified lakehouse catalog context for catalog-coordinated writes.
     pub lakehouse_table: Option<LakehouseExecutionContext>,
+    /// Whether write-side name resolution follows Spark's case-sensitive analyzer setting.
+    pub write_case_sensitive: bool,
 }
 
 impl SinkInfo {
