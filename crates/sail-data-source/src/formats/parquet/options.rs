@@ -7,7 +7,7 @@ use datafusion_common::parquet_config::DFParquetWriterVersion;
 use sail_common_datafusion::datasource::OptionLayer;
 
 use crate::error::{DataSourceError, DataSourceResult};
-use crate::options::gen::{
+use crate::options::r#gen::{
     ParquetReadOptions, ParquetReadPartialOptions, ParquetWriteOptions, ParquetWritePartialOptions,
 };
 use crate::options::{BuildPartialOptions, PartialOptions, ResolveOptions};
@@ -40,6 +40,7 @@ impl BuildPartialOptions<ParquetReadPartialOptions> for TableParquetOptions {
             coerce_int96: self.global.coerce_int96.map(Some),
             bloom_filter_on_read: Some(self.global.bloom_filter_on_read),
             max_predicate_cache_size: Some(self.global.max_predicate_cache_size),
+            path_glob_filter: None,
         })
     }
 }
@@ -59,6 +60,7 @@ impl ParquetReadOptions {
             coerce_int96,
             bloom_filter_on_read,
             max_predicate_cache_size,
+            path_glob_filter: _,
         } = self;
         let global = ParquetOptions {
             enable_page_index,
@@ -312,8 +314,8 @@ mod tests {
     use datafusion::prelude::SessionContext;
     use datafusion_common::parquet_config::DFParquetWriterVersion;
 
-    use crate::options::gen::{ParquetReadOptions, ParquetWriteOptions};
-    use crate::options::{option_list, ResolveOptions};
+    use crate::options::r#gen::{ParquetReadOptions, ParquetWriteOptions};
+    use crate::options::{ResolveOptions, option_list};
 
     #[test]
     fn test_resolve_parquet_read_options() -> datafusion_common::Result<()> {

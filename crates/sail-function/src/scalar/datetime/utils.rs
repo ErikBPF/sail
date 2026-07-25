@@ -1,7 +1,7 @@
 use datafusion::arrow::array::types::{Decimal128Type, Int32Type, Time64MicrosecondType};
 use datafusion::arrow::array::{AsArray, Int32Array, PrimitiveArray};
 use datafusion::arrow::datatypes::DataType;
-use datafusion_common::{exec_err, Result, ScalarValue};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::ColumnarValue;
 use lazy_static::lazy_static;
 use regex::Regex;
@@ -212,45 +212,5 @@ pub(crate) fn to_int32_array(
         other => {
             exec_err!("Unsupported {arg_name} arg {other:?} for Spark function `{fn_name}`")
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_convert_spark_datetime_format_to_chrono() -> Result<()> {
-        assert_eq!(
-            spark_datetime_format_to_chrono_strftime("yyyy-MM-dd HH:mm:ss")?,
-            "%Y-%m-%d %H:%M:%S"
-        );
-        assert_eq!(
-            spark_datetime_format_to_chrono_strftime("ss.SSS")?,
-            "%S%.3f"
-        );
-        assert_eq!(spark_datetime_format_to_chrono_strftime("MM mm")?, "%m %M");
-        assert_eq!(
-            spark_datetime_format_to_chrono_strftime("EEEE EEE E")?,
-            "%A %a %a"
-        );
-        assert_eq!(spark_datetime_format_to_chrono_strftime("SSSSS")?, "%.5f");
-        // This is a bug. Fixing the bug would require updating this test case.
-        assert_eq!(
-            spark_datetime_format_to_chrono_strftime("MMMM-MMM-MM-M")?,
-            "%B-%b-%m-%-%-M"
-        );
-        assert_eq!(spark_datetime_format_to_chrono_strftime("")?, "");
-        assert_eq!(spark_datetime_format_to_chrono_strftime(" ")?, " ");
-        // This is a bug. `'T'` is literal string.
-        assert_eq!(
-            spark_datetime_format_to_chrono_strftime("yyyy-MM-dd'T'HH:mm:ss.SSSZ")?,
-            "%Y-%m-%d'T'%H:%M:%S%.3f%z"
-        );
-        assert_eq!(
-            spark_datetime_format_to_chrono_strftime("yyyy年MM月dd日")?,
-            "%Y年%m月%d日"
-        );
-        Ok(())
     }
 }

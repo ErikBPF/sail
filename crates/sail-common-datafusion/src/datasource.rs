@@ -9,9 +9,9 @@ use datafusion::common::plan_datafusion_err;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_expr::{
-    create_physical_sort_exprs, LexOrdering, LexRequirement, PhysicalSortRequirement,
+    LexOrdering, LexRequirement, PhysicalSortRequirement, create_physical_sort_exprs,
 };
-use datafusion_common::{not_impl_err, plan_err, Constraints, DFSchema, DFSchemaRef, Result};
+use datafusion_common::{Constraints, DFSchema, DFSchemaRef, Result, not_impl_err, plan_err};
 use datafusion_expr::expr::Sort;
 use datafusion_expr::{Expr, TableSource};
 
@@ -67,7 +67,17 @@ impl OptionLayer {
     /// semantics before collecting into a map.
     pub fn into_opaque_option_items(self) -> Vec<(String, String)> {
         match self {
-            OptionLayer::TablePropertyList { items } | OptionLayer::OptionList { items } => items,
+            OptionLayer::TablePropertyList { items } => items
+                .into_iter()
+                .map(|(key, value)| {
+                    if let Some(key) = key.strip_prefix("option.") {
+                        (key.to_string(), value)
+                    } else {
+                        (key, value)
+                    }
+                })
+                .collect(),
+            OptionLayer::OptionList { items } => items,
             OptionLayer::TableLocation { .. }
             | OptionLayer::AsOfTimestamp { .. }
             | OptionLayer::AsOfIntegerVersion { .. }
@@ -733,8 +743,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_jdbc_table_format_error_includes_registration_hint(
-    ) -> std::result::Result<(), String> {
+    fn opaque_option_items_normalize_table_property_prefixes_in_order() {
+        let items = OptionLayer::TablePropertyList {
+            items: vec![
+                ("option.URL".to_string(), "first".to_string()),
+                ("url".to_string(), "second".to_string()),
+            ],
+        }
+        .into_opaque_option_items();
+
+        assert_eq!(
+            items,
+            vec![
+                ("URL".to_string(), "first".to_string()),
+                ("url".to_string(), "second".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_jdbc_table_format_error_includes_registration_hint()
+    -> std::result::Result<(), String> {
         let registry = TableFormatRegistry::new();
         let error = match registry.get("jdbc") {
             Ok(_) => return Err("expected missing jdbc table format error".to_string()),
