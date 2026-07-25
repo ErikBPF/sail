@@ -769,6 +769,41 @@ def test_postgres_write_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
 
 
 @pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_dbtable_whitespace_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    """Spark's JDBCOptions trims dbtable; spaces are not part of the identifier."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    tables = ("wt_pg_native_trimmed", "wt_pg_sail_trimmed")
+    schema = StructType([StructField("id", IntegerType())])
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in tables:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+    try:
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=f"  {tables[0]}  ",
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=[[1]],
+            mode="append",
+        )
+        spark.createDataFrame([(1,)], schema).write.format("jdbc").option("dbtable", f"  {tables[1]}  ").options(
+            **jdbc_opts
+        ).mode("append").save()
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f'SELECT id FROM "{table}"')  # noqa: S608
+                assert cur.fetchall() == [(1,)]
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
 def test_postgres_reordered_case_varied_append_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
     import psycopg
     from pyspark.sql.types import IntegerType, StringType, StructField, StructType

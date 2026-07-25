@@ -1666,7 +1666,7 @@ class JdbcDataSource(DataSource):
             msg = "Cannot write to a 'query'; specify 'dbtable' (a table name) for writes."
             raise ValueError(msg)
 
-        dbtable = opts.get("dbtable")
+        dbtable = opts.get("dbtable", "").strip()
         if not dbtable:
             msg = "Option 'dbtable' is required for jdbc writes."
             raise ValueError(msg)

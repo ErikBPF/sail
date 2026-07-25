@@ -226,7 +226,7 @@ They are safe to drop manually.
 
 | Write option              | Default | Description                                        |
 | ------------------------- | ------- | -------------------------------------------------- |
-| `dbtable`                 |         | Target table (required; `query` not allowed)       |
+| `dbtable`                 |         | Target table, optionally `<schema>.<table>`; surrounding whitespace is ignored |
 | `truncate`                | `false` | Preserve table on MySQL/SQL Server overwrite       |
 | `cascadeTruncate`         | `false` | Cascade PostgreSQL truncate to FK dependencies     |
 | `sail.jdbc.overwriteMode` | —       | `atomic` or `truncate` (PostgreSQL overwrite only) |

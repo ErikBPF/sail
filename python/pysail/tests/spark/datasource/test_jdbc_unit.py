@@ -814,6 +814,17 @@ def test_overwrite_mode_default_matches_spark():
     assert writer._engine.overwrite_mode == "append"  # noqa: SLF001
 
 
+def test_write_dbtable_trims_surrounding_whitespace_like_spark():
+    """JDBCOptions.tableOrQuery trims dbtable before save-mode planning."""
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "  public.events  "})
+    writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
+    assert writer._dbtable == "public.events"  # noqa: SLF001
+
+
 def test_writer_construction_is_database_side_effect_free(monkeypatch):
     import pyarrow as pa
 
