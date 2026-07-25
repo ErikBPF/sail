@@ -10,15 +10,17 @@ use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Extension, LogicalPlan, TableSource, UserDefinedLogicalNode};
+use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use datafusion_common::{internal_err, DFSchema, DFSchemaRef, Result};
+use datafusion_common::{internal_err, plan_err, DFSchema, DFSchemaRef, Result};
 use datafusion_expr::{Expr, UserDefinedLogicalNodeCore};
 use educe::Educe;
 use sail_common_datafusion::datasource::{
     OptionLayer, SinkInfo, SinkMode, SourceInfo, TableFormat, TableFormatRegistry,
 };
 use sail_common_datafusion::utils::items::ItemTaker;
+use sail_physical_plan::repartition::ExplicitRepartitionExec;
 
 use super::datasource::PythonDataSource;
 use super::discovery::DATA_SOURCE_REGISTRY;
@@ -41,6 +43,29 @@ fn sink_mode_name(mode: &SinkMode) -> &'static str {
             "overwrite"
         }
     }
+}
+
+fn jdbc_write_num_partitions(
+    data_source_name: &str,
+    options: &[(String, String)],
+) -> Result<Option<usize>> {
+    if !data_source_name.eq_ignore_ascii_case("jdbc") {
+        return Ok(None);
+    }
+    let Some((_, value)) = options
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case("numPartitions"))
+    else {
+        return Ok(None);
+    };
+    let Ok(value) = value.parse::<usize>() else {
+        return plan_err!("JDBC option 'numPartitions' must be a positive integer");
+    };
+    if value == 0 {
+        return plan_err!("JDBC option 'numPartitions' must be a positive integer");
+    }
+    Ok(Some(value))
 }
 
 /// TableFormat implementation for a Python data source.
@@ -360,6 +385,7 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
                 node.write_case_sensitive.to_string(),
             )))
             .collect();
+        let partition_limit = jdbc_write_num_partitions(&node.name, &opaque_options)?;
         let table_format = PythonTableFormat {
             name: node.name.clone(),
             pickled_class: node.pickled_class.clone(),
@@ -367,6 +393,13 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
         let datasource = table_format.create_datasource(&opaque_options)?;
         let executor: Arc<dyn super::executor::PythonExecutor> =
             Arc::new(InProcessExecutor::from_app_config());
+        let input = match partition_limit {
+            Some(limit) if limit < input.properties().partitioning.partition_count() => Arc::new(
+                ExplicitRepartitionExec::new(input.clone(), Partitioning::RoundRobinBatch(limit)),
+            )
+                as Arc<dyn ExecutionPlan>,
+            _ => input.clone(),
+        };
         let schema = input.schema();
         let expected_partitions = input.properties().partitioning.partition_count();
         let writer_plan = executor
@@ -375,7 +408,7 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
         let pickled_writer = writer_plan.pickled_writer;
         let write_exec: Arc<dyn ExecutionPlan> =
             Arc::new(super::write_exec::PythonDataSourceWriteExec::new(
-                input.clone(),
+                input,
                 pickled_writer.clone(),
                 writer_plan.is_arrow,
             ));
@@ -419,5 +452,29 @@ mod tests {
         assert_eq!(merged.get("url").map(String::as_str), Some("second"));
         assert_eq!(merged.get("dbtable").map(String::as_str), Some("items"));
         assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_jdbc_write_num_partitions_is_case_insensitive_and_last_wins() {
+        let options = vec![
+            ("numPartitions".to_string(), "4".to_string()),
+            ("NUMPARTITIONS".to_string(), "2".to_string()),
+        ];
+        assert!(matches!(
+            jdbc_write_num_partitions("jdbc", &options),
+            Ok(Some(2))
+        ));
+        assert!(matches!(
+            jdbc_write_num_partitions("other", &options),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn test_jdbc_write_num_partitions_rejects_non_positive_values() {
+        for value in ["0", "-1", "not-an-integer"] {
+            let options = vec![("numPartitions".to_string(), value.to_string())];
+            assert!(jdbc_write_num_partitions("jdbc", &options).is_err());
+        }
     }
 }

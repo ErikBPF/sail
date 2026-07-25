@@ -274,7 +274,7 @@ def test_arrow_to_sqlalchemy_type_mapping():
         _arrow_to_sqlalchemy_type(pa.struct([("x", pa.int32())]), "mssql")
 
 
-@pytest.mark.parametrize("bad", ["0", "-1"])
+@pytest.mark.parametrize("bad", ["0", "-1", "not-an-integer"])
 def test_write_batchsize_must_be_positive(bad):
     """writer() rejects a non-positive batchsize on the driver, before fan-out.
 
@@ -289,6 +289,196 @@ def test_write_batchsize_must_be_positive(bad):
     ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "t", "batchsize": bad})
     with pytest.raises(ValueError, match="batchsize"):
         ds.writer(schema, overwrite=False)
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "not-an-integer"])
+def test_write_num_partitions_must_be_positive_integer(bad):
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    ds = JdbcDataSource(
+        options={
+            "url": "jdbc:postgresql://localhost/db",
+            "dbtable": "t",
+            "numPartitions": bad,
+        }
+    )
+    with pytest.raises(ValueError, match="numPartitions"):
+        ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
+
+
+def test_arrow_chunks_honor_batchsize_and_partial_tail():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _iter_arrow_chunks
+
+    table = pa.table({"id": range(5)})
+    chunks = list(_iter_arrow_chunks(table, 2))
+
+    assert [chunk.num_rows for chunk in chunks] == [2, 2, 1]
+    assert [value.as_py() for chunk in chunks for value in chunk["id"]] == list(range(5))
+
+
+def test_sqlalchemy_insert_calls_respect_batchsize(tmp_path):
+    sa = pytest.importorskip("sqlalchemy")
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
+
+    url = f"sqlite:///{tmp_path / 'target.db'}"
+    engine = sa.create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE t (id INTEGER)"))
+    table = sa.Table("t", sa.MetaData(), autoload_with=engine)
+    batch_lengths = []
+
+    @sa.event.listens_for(engine, "before_cursor_execute")
+    def record_batch(_conn, _cursor, statement, parameters, _context, executemany):
+        if statement.lstrip().upper().startswith("INSERT"):
+            batch_lengths.append(len(parameters) if executemany else 1)
+
+    writer = SqlAlchemyWriteEngine(
+        url=url,
+        dbtable="t",
+        columns=["id"],
+        overwrite=False,
+        batch_size=2,
+        run_id="run",
+    )
+    try:
+        writer._insert_arrow(engine, table, pa.table({"id": range(5)}))  # noqa: SLF001
+    finally:
+        engine.dispose()
+
+    assert batch_lengths == [2, 2, 1]
+
+
+def test_postgres_adbc_ingest_calls_respect_batchsize(monkeypatch):
+    import adbc_driver_postgresql.dbapi as pg_dbapi
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    ingested = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def adbc_ingest(self, _table, chunk, **_kwargs):
+            ingested.append(chunk.num_rows)
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(pg_dbapi, "connect", lambda *_a, **_k: FakeConnection())
+    monkeypatch.setattr(jdbc, "_pg_target_columns", lambda *_a, **_k: ["id"])
+    writer = jdbc.PgWriteEngine(
+        dsn="postgresql://unused",
+        dbtable="t",
+        batch_size=2,
+    )
+    writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": range(5)})])
+
+    assert ingested == [2, 2, 1]
+
+
+def test_sqlalchemy_writer_streams_before_requesting_next_batch(tmp_path):
+    sa = pytest.importorskip("sqlalchemy")
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
+
+    url = f"sqlite:///{tmp_path / 'target.db'}"
+    engine = sa.create_engine(url)
+    with engine.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE t (id INTEGER)"))
+    inserts = []
+
+    @sa.event.listens_for(sa.engine.Engine, "before_cursor_execute")
+    def record_insert(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("INSERT"):
+            inserts.append(parameters)
+
+    writer = SqlAlchemyWriteEngine(
+        url=url,
+        dbtable="t",
+        columns=["id"],
+        overwrite=False,
+        batch_size=1000,
+        run_id="stream",
+    )
+
+    def batches():
+        yield pa.RecordBatch.from_pydict({"id": [1]})
+        assert len(inserts) == 1
+        yield pa.RecordBatch.from_pydict({"id": [2]})
+
+    try:
+        writer.write_partition(0, batches())
+        with engine.connect() as conn:
+            assert conn.execute(sa.text("SELECT id FROM t ORDER BY id")).fetchall() == [(1,), (2,)]
+    finally:
+        sa.event.remove(sa.engine.Engine, "before_cursor_execute", record_insert)
+        engine.dispose()
+
+
+def test_postgres_writer_streams_before_requesting_next_batch(monkeypatch):
+    import adbc_driver_postgresql.dbapi as pg_dbapi
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    ingested = []
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def adbc_ingest(self, _table, chunk, **_kwargs):
+            ingested.extend(chunk["id"].to_pylist())
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return FakeCursor()
+
+        def commit(self):
+            pass
+
+    def batches():
+        yield pa.RecordBatch.from_pydict({"id": [1]})
+        assert ingested == [1]
+        yield pa.RecordBatch.from_pydict({"id": [2]})
+
+    monkeypatch.setattr(pg_dbapi, "connect", lambda *_a, **_k: FakeConnection())
+    monkeypatch.setattr(jdbc, "_pg_target_columns", lambda *_a, **_k: ["id"])
+    writer = jdbc.PgWriteEngine(dsn="postgresql://unused", dbtable="t")
+    writer.write_partition(0, batches())
+
+    assert ingested == [1, 2]
 
 
 def test_sqlalchemy_staging_create_is_retry_safe(tmp_path):
@@ -313,6 +503,42 @@ def test_sqlalchemy_staging_create_is_retry_safe(tmp_path):
         writer._create_staging_like_target(engine, staging)  # second create must not raise  # noqa: SLF001
     finally:
         engine.dispose()
+
+
+def test_sqlalchemy_partition_failure_removes_created_staging(tmp_path, monkeypatch):
+    """Failure after CREATE must not leave a random staging table unknown to abort()."""
+    sa = pytest.importorskip("sqlalchemy")
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
+
+    url = f"sqlite:///{tmp_path / 'target.db'}"
+    setup = sa.create_engine(url)
+    with setup.begin() as conn:
+        conn.execute(sa.text("CREATE TABLE t (id INTEGER)"))
+    setup.dispose()
+
+    writer = SqlAlchemyWriteEngine(
+        url=url,
+        dbtable="t",
+        columns=["id"],
+        overwrite=True,
+        batch_size=1000,
+        run_id="run",
+    )
+
+    def fail_after_create(*_args, **_kwargs):
+        raise RuntimeError("injected ingest failure")
+
+    monkeypatch.setattr(writer, "_insert_arrow", fail_after_create)
+    with pytest.raises(RuntimeError, match="injected ingest failure"):
+        writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
+
+    check = sa.create_engine(url)
+    try:
+        assert sa.inspect(check).get_table_names() == ["t"]
+    finally:
+        check.dispose()
 
 
 def test_sqlalchemy_overwrite_distinct_partitions_no_data_loss(tmp_path):
@@ -392,22 +618,15 @@ def test_sqlalchemy_url_translation():
 
 
 def test_sqlserver_url_parsing_preserves_params():
-    """The SQL Server URL parser keeps every ;key=value; param, not just databaseName.
-
-    This is the regression guard for the earlier bug where encrypt /
-    trustServerCertificate / applicationIntent were silently dropped.
-    """
+    """Supported SQL Server properties are preserved without weakening TLS."""
     from pysail.spark.datasource.jdbc import _parse_sqlserver_url, _sqlalchemy_url
 
     url, connect_args = _sqlalchemy_url(
-        "sqlserver://u:p@h:1433;databaseName=db;encrypt=true;trustServerCertificate=true;applicationIntent=ReadOnly"
+        "sqlserver://u:p@h:1433;databaseName=db;encrypt=true;applicationIntent=ReadOnly"
     )
     assert url == "mssql+pymssql://u:p@h:1433/db"
     assert connect_args["encryption"] == "require"
     assert connect_args["read_only"] is True
-    # trustServerCertificate is accepted but intentionally not mapped (FreeTDS handles trust)
-    assert "trustServerCertificate" not in connect_args
-
     # encrypt=false maps to encryption off
     _, ca = _parse_sqlserver_url("u:p@h:1433;databaseName=db;encrypt=false")
     assert ca["encryption"] == "off"
@@ -456,6 +675,35 @@ def test_sqlserver_url_credentials_as_params():
     # Credentials already in the authority win; params do not override them
     url5, _ = _parse_sqlserver_url("u:p@h:1433;databaseName=db;user=alice;password=s3cret")
     assert url5 == "mssql+pymssql://u:p@h:1433/db"
+
+
+@pytest.mark.parametrize("value", ["strict", "mandatory", "optional", "garbage", ""])
+def test_sqlserver_url_rejects_encrypt_values_pymssql_cannot_preserve(value):
+    """Never weaken JDBC TLS semantics by silently translating them to encryption=off."""
+    from pysail.spark.datasource.jdbc import _parse_sqlserver_url
+
+    with pytest.raises(ValueError, match="encrypt"):
+        _parse_sqlserver_url(f"h;databaseName=db;encrypt={value}")
+
+
+@pytest.mark.parametrize(
+    "property_name",
+    ["trustServerCertificate", "hostNameInCertificate", "trustStore", "trustStorePassword"],
+)
+def test_sqlserver_url_rejects_unhonored_jdbc_tls_properties(property_name):
+    from pysail.spark.datasource.jdbc import _parse_sqlserver_url
+
+    with pytest.raises(ValueError, match=property_name):
+        _parse_sqlserver_url(f"h;databaseName=db;{property_name}=value")
+
+
+def test_sqlserver_tls_rejection_redacts_parameter_password():
+    from pysail.spark.datasource.jdbc import _parse_sqlserver_url
+
+    with pytest.raises(ValueError) as exc_info:
+        _parse_sqlserver_url("h;databaseName=db;user=alice;password=topsecret;encrypt=strict")
+
+    assert "topsecret" not in str(exc_info.value)
 
 
 def test_write_options_no_url_raises():
@@ -515,6 +763,38 @@ def test_pg_write_engine_staging_name():
     assert _staging_name_atomic("orders", "abc123") == "orders__sail_stg_abc123"
 
 
+@pytest.mark.parametrize(
+    "helper",
+    ["_staging_name_atomic", "_staging_name_truncate_sentinel"],
+)
+def test_postgres_generated_names_fit_identifier_byte_limit(helper):
+    """PostgreSQL limits identifiers by bytes; generated names must not be server-truncated."""
+    from pysail.spark.datasource import jdbc
+
+    generated = getattr(jdbc, helper)("public." + ("é" * 31), "0123456789ab")
+
+    schema, table = generated.split(".", 1)
+    assert schema == "public"
+    assert len(table.encode("utf-8")) <= 63  # PostgreSQL default NAMEDATALEN - 1
+
+
+@pytest.mark.parametrize(
+    "helper",
+    ["_staging_name_atomic", "_staging_name_truncate_sentinel"],
+)
+def test_postgres_generated_names_remain_distinct_after_server_truncation(helper):
+    """Run token must survive PostgreSQL's 63-byte truncation."""
+    from pysail.spark.datasource import jdbc
+
+    target = "t" * 63
+    first = getattr(jdbc, helper)(target, "aaaaaaaaaaaa").encode()[:63]
+    second = getattr(jdbc, helper)(target, "bbbbbbbbbbbb").encode()[:63]
+
+    assert first != target.encode()
+    assert second != target.encode()
+    assert first != second
+
+
 # ---------------------------------------------------------------------------
 # overwrite_mode option resolution
 # ---------------------------------------------------------------------------
@@ -564,6 +844,23 @@ def test_column_resolution_matches_spark_names():
         _resolve_column_names(["missing"], ["id"])
     with pytest.raises(ValueError, match="uniquely"):
         _resolve_column_names(["Id"], ["ID", "id"])
+
+
+def test_column_resolution_preserves_source_order_and_target_spelling():
+    from pysail.spark.datasource.jdbc import _resolve_column_names
+
+    assert _resolve_column_names(
+        ["displayname", "id"],
+        ["ID", "DisplayName", "unused"],
+    ) == ["DisplayName", "ID"]
+
+
+def test_column_resolution_honors_case_sensitive_analysis():
+    from pysail.spark.datasource.jdbc import _resolve_column_names
+
+    assert _resolve_column_names(["ID"], ["ID", "id"], case_sensitive=True) == ["ID"]
+    with pytest.raises(ValueError, match="cannot be resolved"):
+        _resolve_column_names(["Id"], ["ID"], case_sensitive=True)
 
 
 def test_unsupported_type_fails_after_missing_target_check(monkeypatch):
@@ -642,6 +939,34 @@ def test_sqlalchemy_truncate_option_preserves_target(monkeypatch):
     assert writer._engine.overwrite is False  # noqa: SLF001
 
 
+@pytest.mark.parametrize("cascade", ["false", "true"])
+def test_postgres_truncate_option_uses_spark_dialect_sql(monkeypatch, cascade):
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    calls = []
+    monkeypatch.setattr(jdbc, "_pg_table_exists", lambda *_a, **_k: True)
+    monkeypatch.setattr(jdbc, "_pg_target_columns", lambda *_a, **_k: ["id"])
+    monkeypatch.setattr(
+        jdbc,
+        "_truncate_pg_table",
+        lambda *_a, **kwargs: calls.append(kwargs["cascade"]),
+    )
+    writer = jdbc.JdbcDataSource(
+        options={
+            "url": "jdbc:postgresql://localhost/db",
+            "dbtable": "t",
+            "truncate": "true",
+            "cascadeTruncate": cascade,
+            "__sail_save_mode": "overwrite",
+        }
+    ).writer(pa.schema([("id", pa.int32())]), overwrite=True)
+
+    assert writer._sail_prepare() == "write"  # noqa: SLF001
+    assert calls == [cascade == "true"]
+
+
 @pytest.mark.usefixtures("stub_target_exists")
 def test_truncate_option_rejects_non_boolean():
     import pyarrow as pa
@@ -650,6 +975,24 @@ def test_truncate_option_rejects_non_boolean():
 
     ds = JdbcDataSource(options={"url": "jdbc:mysql://localhost/db", "dbtable": "t", "truncate": "sometimes"})
     with pytest.raises(ValueError, match="truncate"):
+        ds.writer(pa.schema([("id", pa.int32())]), overwrite=True)
+
+
+@pytest.mark.usefixtures("stub_target_exists")
+def test_cascade_truncate_option_rejects_non_boolean():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    ds = JdbcDataSource(
+        options={
+            "url": "jdbc:postgresql://localhost/db",
+            "dbtable": "t",
+            "truncate": "true",
+            "cascadeTruncate": "sometimes",
+        }
+    )
+    with pytest.raises(ValueError, match="cascadeTruncate"):
         ds.writer(pa.schema([("id", pa.int32())]), overwrite=True)
 
 

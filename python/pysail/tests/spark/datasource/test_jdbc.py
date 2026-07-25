@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from testcontainers.postgres import PostgresContainer
+from testcontainers.community.postgres import PostgresContainer
 
 from pysail.testing.spark.jdbc_oracle import native_spark_4_1_2_python, run_native_jdbc_write
 from pysail.testing.spark.utils.common import pyspark_version
@@ -604,6 +604,36 @@ def _read_pg_table(spark, jdbc_opts, table: str):
     return spark.read.format("jdbc").option("dbtable", table).options(**jdbc_opts).load()
 
 
+def test_postgres_server_version_is_pinned(pg_dsn):
+    import psycopg
+
+    with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+        cur.execute("SHOW server_version")
+        assert cur.fetchone()[0].startswith("16.")
+
+
+def _pg_snapshot(pg_dsn, table):
+    import psycopg
+
+    with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name, data_type, is_nullable, identity_generation "
+            "FROM information_schema.columns WHERE table_name = %s ORDER BY ordinal_position",
+            (table,),
+        )
+        columns = cur.fetchall()
+        cur.execute(
+            "SELECT a.attname FROM pg_index i "
+            "JOIN pg_class t ON t.oid = i.indrelid "
+            "JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey) "
+            "WHERE t.oid = to_regclass(%s) ORDER BY a.attname",
+            (table,),
+        )
+        indexed_columns = cur.fetchall()
+        cur.execute(f'SELECT * FROM "{table}"')  # noqa: S608
+        return columns, indexed_columns, sorted(cur.fetchall(), key=repr)
+
+
 @pytest.mark.parametrize("write_table", ["wt_append_basic"], indirect=True)
 def test_write_append_basic(spark, jdbc_opts, write_table):
     """Append-mode write round-trips rows correctly."""
@@ -738,6 +768,363 @@ def test_postgres_write_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
             cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
 
 
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_reordered_case_varied_append_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    native_table = "wt_pg_native_columns"
+    sail_table = "wt_pg_sail_columns"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in (native_table, sail_table):
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'CREATE TABLE "{table}" ("ID" INTEGER, "DisplayName" TEXT)')
+    try:
+        schema = StructType([StructField("displayname", StringType()), StructField("id", IntegerType())])
+        rows = [["Alice", 1], ["Bob", 2]]
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=native_table,
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode="append",
+        )
+        spark.createDataFrame([tuple(row) for row in rows], schema).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).options(**jdbc_opts).mode("append").save()
+
+        assert _pg_snapshot(pg_dsn, native_table) == _pg_snapshot(pg_dsn, sail_table)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_default_overwrite_schema_change_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    native_table = "wt_pg_native_schema"
+    sail_table = "wt_pg_sail_schema"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in (native_table, sail_table):
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'CREATE TABLE "{table}" (old_id INTEGER, old_value TEXT)')
+    try:
+        schema = StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
+        rows = [[1, "new"]]
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=native_table,
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode="overwrite",
+        )
+        spark.createDataFrame([tuple(row) for row in rows], schema).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).options(**jdbc_opts).mode("overwrite").save()
+
+        assert _pg_snapshot(pg_dsn, native_table) == _pg_snapshot(pg_dsn, sail_table)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+
+
+@pytest.mark.parametrize("mode", ["errorifexists", "ignore"])
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_existing_table_nonwriting_modes_match_native_spark_4_1_2(
+    spark,
+    jdbc_opts,
+    pg_dsn,
+    mode,
+):
+    import subprocess
+
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    native_table = f"wt_pg_native_{mode}"
+    sail_table = f"wt_pg_sail_{mode}"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in (native_table, sail_table):
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'CREATE TABLE "{table}" (id INTEGER, name TEXT)')
+            cur.execute(f'INSERT INTO "{table}" VALUES (1, %s)', ("old",))
+    try:
+        schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+        rows = [[2, "new"]]
+
+        def native_call():
+            run_native_jdbc_write(
+                dialect="postgresql",
+                jdbc_url=jdbc_opts["url"],
+                dbtable=native_table,
+                user=jdbc_opts["user"],
+                password=jdbc_opts["password"],
+                schema_json=schema.jsonValue(),
+                rows=rows,
+                mode=mode,
+                select_exprs=["raise_error('ignore evaluated input') AS id"] if mode == "ignore" else None,
+            )
+
+        def sail_call():
+            df = (
+                spark.range(1).selectExpr("raise_error('ignore evaluated input') AS id")
+                if mode == "ignore"
+                else spark.createDataFrame([tuple(row) for row in rows], schema)
+            )
+            (df.write.format("jdbc").option("dbtable", sail_table).options(**jdbc_opts).mode(mode).save())
+
+        if mode == "errorifexists":
+            with pytest.raises(subprocess.CalledProcessError):
+                native_call()
+            with pytest.raises(Exception, match="errorifexists is not supported"):
+                sail_call()
+        else:
+            native_call()
+            sail_call()
+
+        assert _pg_snapshot(pg_dsn, native_table) == _pg_snapshot(pg_dsn, sail_table)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+
+
+@pytest.mark.parametrize("mode", [None, "append", "overwrite", "ignore"])
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_missing_table_save_modes_match_native_spark_4_1_2(
+    spark,
+    jdbc_opts,
+    pg_dsn,
+    mode,
+):
+    import psycopg
+
+    suffix = mode or "default"
+    native_table = f"wt_pg_native_missing_{suffix}"
+    sail_table = f"wt_pg_sail_missing_{suffix}"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+    try:
+        from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+        schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+        rows = [[1, "new"]]
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=native_table,
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode=mode,
+        )
+        writer = (
+            spark.createDataFrame([tuple(row) for row in rows], schema)
+            .write.format("jdbc")
+            .option("dbtable", sail_table)
+            .options(**jdbc_opts)
+        )
+        if mode is not None:
+            writer = writer.mode(mode)
+        writer.save()
+
+        assert _pg_snapshot(pg_dsn, native_table) == _pg_snapshot(pg_dsn, sail_table)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_truncate_option_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    """Settle Spark docs/source disagreement using observable database state."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    native_table = "wt_pg_native_truncate"
+    sail_table = "wt_pg_sail_truncate"
+    schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+    rows = [[2, "new"]]
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in (native_table, sail_table):
+            cur.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')  # noqa: S608
+            cur.execute(f'CREATE TABLE "{table}" (id INTEGER, name TEXT)')  # noqa: S608
+            cur.execute(f'CREATE INDEX "{table}_name_idx" ON "{table}" (name)')  # noqa: S608
+            cur.execute(f'INSERT INTO "{table}" VALUES (1, %s)', ("old",))  # noqa: S608
+    try:
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=native_table,
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=rows,
+            mode="overwrite",
+            options={"truncate": "true"},
+        )
+        spark.createDataFrame([tuple(row) for row in rows], schema).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).option("truncate", "true").options(**jdbc_opts).mode("overwrite").save()
+
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            snapshots = []
+            for table in (native_table, sail_table):
+                cur.execute(
+                    "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+                    "WHERE table_name = %s ORDER BY ordinal_position",
+                    (table,),
+                )
+                columns = cur.fetchall()
+                cur.execute("SELECT to_regclass(%s)", (f"{table}_name_idx",))
+                index_exists = cur.fetchone()[0] is not None
+                cur.execute(f'SELECT id, name FROM "{table}" ORDER BY id')  # noqa: S608
+                snapshots.append((columns, index_exists, cur.fetchall()))
+            assert snapshots[0] == snapshots[1]
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}" CASCADE')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}" CASCADE')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_truncate_schema_mismatch_failure_matches_native_spark_4_1_2(
+    spark,
+    jdbc_opts,
+    pg_dsn,
+):
+    import subprocess
+
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    native_table = "wt_pg_native_truncate_mismatch"
+    sail_table = "wt_pg_sail_truncate_mismatch"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in (native_table, sail_table):
+            cur.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')
+            cur.execute(f'CREATE TABLE "{table}" (old_id INTEGER)')
+            cur.execute(f'INSERT INTO "{table}" VALUES (1)')
+    try:
+        schema = StructType([StructField("new_id", IntegerType())])
+        rows = [[2]]
+        with pytest.raises(subprocess.CalledProcessError):
+            run_native_jdbc_write(
+                dialect="postgresql",
+                jdbc_url=jdbc_opts["url"],
+                dbtable=native_table,
+                user=jdbc_opts["user"],
+                password=jdbc_opts["password"],
+                schema_json=schema.jsonValue(),
+                rows=rows,
+                mode="overwrite",
+                options={"truncate": "true"},
+            )
+        with pytest.raises(Exception, match=r"new_id|schema"):
+            (
+                spark.createDataFrame([tuple(row) for row in rows], schema)
+                .write.format("jdbc")
+                .option("dbtable", sail_table)
+                .option("truncate", "true")
+                .options(**jdbc_opts)
+                .mode("overwrite")
+                .save()
+            )
+
+        assert _pg_snapshot(pg_dsn, native_table) == _pg_snapshot(pg_dsn, sail_table)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{native_table}" CASCADE')
+            cur.execute(f'DROP TABLE IF EXISTS "{sail_table}" CASCADE')
+
+
+@pytest.mark.parametrize("cascade", [False, True])
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_cascade_truncate_matches_native_spark_4_1_2(
+    spark,
+    jdbc_opts,
+    pg_dsn,
+    cascade,
+):
+    import subprocess
+
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    native_parent = f"wt_pg_native_fk_{str(cascade).lower()}"
+    sail_parent = f"wt_pg_sail_fk_{str(cascade).lower()}"
+    native_child = f"{native_parent}_child"
+    sail_child = f"{sail_parent}_child"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for parent, child in ((native_parent, native_child), (sail_parent, sail_child)):
+            cur.execute(f'DROP TABLE IF EXISTS "{child}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{parent}" CASCADE')
+            cur.execute(f'CREATE TABLE "{parent}" (id INTEGER PRIMARY KEY)')
+            cur.execute(f'CREATE TABLE "{child}" (parent_id INTEGER REFERENCES "{parent}" (id))')
+            cur.execute(f'INSERT INTO "{parent}" VALUES (1)')
+            cur.execute(f'INSERT INTO "{child}" VALUES (1)')
+    try:
+        schema = StructType([StructField("id", IntegerType())])
+        rows = [[2]]
+
+        def native_call():
+            run_native_jdbc_write(
+                dialect="postgresql",
+                jdbc_url=jdbc_opts["url"],
+                dbtable=native_parent,
+                user=jdbc_opts["user"],
+                password=jdbc_opts["password"],
+                schema_json=schema.jsonValue(),
+                rows=rows,
+                mode="overwrite",
+                options={
+                    "truncate": "true",
+                    "cascadeTruncate": str(cascade).lower(),
+                },
+            )
+
+        def sail_call():
+            (
+                spark.createDataFrame([tuple(row) for row in rows], schema)
+                .write.format("jdbc")
+                .option("dbtable", sail_parent)
+                .option("truncate", "true")
+                .option("cascadeTruncate", str(cascade).lower())
+                .options(**jdbc_opts)
+                .mode("overwrite")
+                .save()
+            )
+
+        if cascade:
+            native_call()
+            sail_call()
+        else:
+            with pytest.raises(subprocess.CalledProcessError):
+                native_call()
+            with pytest.raises(Exception, match=r"foreign key|constraint"):
+                sail_call()
+
+        assert _pg_snapshot(pg_dsn, native_parent) == _pg_snapshot(pg_dsn, sail_parent)
+        assert _pg_snapshot(pg_dsn, native_child) == _pg_snapshot(pg_dsn, sail_child)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            for parent, child in ((native_parent, native_child), (sail_parent, sail_child)):
+                cur.execute(f'DROP TABLE IF EXISTS "{child}"')
+                cur.execute(f'DROP TABLE IF EXISTS "{parent}" CASCADE')
+
+
 @pytest.mark.parametrize("write_table", ["wt_default_mode"], indirect=True)
 def test_write_default_mode_rejects_existing_target(spark, jdbc_opts, write_table):
     """Spark's default errorIfExists mode must not silently append."""
@@ -793,21 +1180,30 @@ def test_write_overwrite_replaces_schema(spark, jdbc_opts, pg_dsn, write_table):
 
 
 @pytest.mark.parametrize("write_table", ["wt_pg_truncate_option"], indirect=True)
-def test_postgres_truncate_option_uses_spark_drop_recreate(spark, jdbc_opts, pg_dsn, write_table):
-    """PostgresDialect ignores truncate=true, so overwrite still replaces schema."""
+def test_postgres_truncate_option_preserves_existing_schema(spark, jdbc_opts, pg_dsn, write_table):
+    """Spark's PostgreSQL dialect truncates with ONLY and preserves metadata."""
     import psycopg
-    from pyspark.sql.types import IntegerType, StructField, StructType
+    from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 
     with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
         cur.execute(f'CREATE INDEX "{write_table}_name_idx" ON "{write_table}" (name)')
-    df = spark.createDataFrame([(7,)], StructType([StructField("new_id", IntegerType())]))
+    df = spark.createDataFrame(
+        [(7, "new", 2.0)],
+        StructType(
+            [
+                StructField("id", IntegerType()),
+                StructField("name", StringType()),
+                StructField("score", DoubleType()),
+            ]
+        ),
+    )
     df.write.format("jdbc").option("dbtable", write_table).option("truncate", "true").options(**jdbc_opts).mode(
         "overwrite"
     ).save()
 
     with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s)", (f"{write_table}_name_idx",))
-        assert cur.fetchone()[0] is None
+        assert cur.fetchone()[0] is not None
 
 
 @pytest.mark.parametrize("write_table", ["wt_overwrite"], indirect=True)
@@ -850,6 +1246,45 @@ def test_write_overwrite_small_batchsize_writes_all_rows(spark, jdbc_opts, write
     result = _read_pg_table(spark, jdbc_opts, write_table)
     assert result.count() == 5  # noqa: PLR2004
     assert {r.id for r in result.collect()} == {1, 2, 3, 4, 5}
+
+
+@pytest.mark.parametrize(
+    ("input_partitions", "limit", "expected_connections"),
+    [(8, 2, 2), (1, 4, 1)],
+)
+def test_write_num_partitions_caps_connections_without_scaling_up(
+    spark,
+    jdbc_opts,
+    pg_dsn,
+    input_partitions,
+    limit,
+    expected_connections,
+):
+    import psycopg
+
+    table = f"wt_num_partitions_{input_partitions}_{limit}"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id BIGINT, writer_pid INTEGER DEFAULT pg_backend_pid())')
+    try:
+        (
+            spark.range(800)
+            .repartition(input_partitions)
+            .write.format("jdbc")
+            .option("dbtable", table)
+            .option("numPartitions", str(limit))
+            .options(**jdbc_opts)
+            .mode("append")
+            .save()
+        )
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'SELECT COUNT(*), COUNT(DISTINCT writer_pid) FROM "{table}"')
+            row_count, connection_count = cur.fetchone()
+        assert row_count == 800  # noqa: PLR2004
+        assert connection_count == expected_connections
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
 
 
 @pytest.mark.parametrize("write_table", ["wt_empty_df"], indirect=True)
@@ -969,6 +1404,192 @@ def test_write_overwrite_atomic_serial_sequence(spark, jdbc_opts, pg_dsn, serial
         cur.execute(f'INSERT INTO "{serial_write_table}" (name) VALUES (%s) RETURNING id', ("Eve",))  # noqa: S608
         new_id = cur.fetchone()[0]
     assert new_id > 11  # noqa: PLR2004
+
+
+@pytest.mark.parametrize("generation", ["ALWAYS", "BY DEFAULT"])
+def test_write_overwrite_atomic_identity_sequence(spark, jdbc_opts, pg_dsn, generation):
+    """Atomic swap must retain identity semantics and advance past explicitly loaded IDs."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    table = f"wt_atomic_identity_{generation.lower().replace(' ', '_')}"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')  # noqa: S608
+        cur.execute(  # noqa: S608
+            f'CREATE TABLE "{table}" (id INTEGER GENERATED {generation} AS IDENTITY PRIMARY KEY, name TEXT)'
+        )
+    try:
+        schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
+        spark.createDataFrame([(10, "ten"), (11, "eleven")], schema).write.format("jdbc").option(
+            "dbtable", table
+        ).option("sail.jdbc.overwriteMode", "atomic").options(**jdbc_opts).mode("overwrite").save()
+
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT identity_generation FROM information_schema.columns "
+                "WHERE table_name = %s AND column_name = 'id'",
+                (table,),
+            )
+            assert cur.fetchone()[0] == generation
+            cur.execute(f'INSERT INTO "{table}" (name) VALUES (%s) RETURNING id', ("next",))  # noqa: S608
+            assert cur.fetchone()[0] > 11  # noqa: PLR2004
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}" CASCADE')  # noqa: S608
+
+
+def test_postgres_partition_failure_cleans_atomic_staging(pg_dsn, monkeypatch):
+    import adbc_driver_postgresql.dbapi as pg_dbapi
+    import psycopg
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import PgWriteEngine, _staging_name_atomic
+
+    table = "wt_pg_failed_partition"
+    run_id = "failed"
+    staging = _staging_name_atomic(table, run_id)
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id INTEGER)')
+    try:
+        writer = PgWriteEngine(
+            dsn=pg_dsn,
+            dbtable=table,
+            overwrite_mode="atomic",
+            batch_size=1000,
+            run_id=run_id,
+        )
+
+        def fail_after_create(*_args, **_kwargs):
+            raise RuntimeError("injected ingest failure")
+
+        monkeypatch.setattr(pg_dbapi, "connect", fail_after_create)
+        with pytest.raises(RuntimeError, match="injected ingest failure"):
+            writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
+
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute("SELECT to_regclass(%s)", (staging,))
+            assert cur.fetchone()[0] is None
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.parametrize("table", ["t" * 63, "é" * 31])
+def test_postgres_atomic_overwrite_long_target_is_collision_safe(pg_dsn, table):
+    import psycopg
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import PgWriteEngine, _staging_name_atomic
+
+    writer = PgWriteEngine(
+        dsn=pg_dsn,
+        dbtable=table,
+        overwrite_mode="atomic",
+        batch_size=1000,
+        run_id="longname",
+    )
+    staging = _staging_name_atomic(table, writer.run_id)
+    assert staging != table
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id INTEGER)')
+    try:
+        batch = pa.RecordBatch.from_pydict({"id": pa.array([1], type=pa.int32())})
+        result = writer.write_partition(0, [batch])
+        writer.commit([result])
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'SELECT id FROM "{table}"')
+            assert cur.fetchall() == [(1,)]
+            cur.execute("SELECT to_regclass(%s)", (staging,))
+            assert cur.fetchone()[0] is None
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{staging}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+def test_postgres_partition_failure_rolls_back_only_failed_partition(pg_dsn):
+    import psycopg
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import PgWriteEngine
+
+    table = "wt_pg_partition_rollback"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id INTEGER PRIMARY KEY)')
+    try:
+        writer = PgWriteEngine(dsn=pg_dsn, dbtable=table, batch_size=1000)
+        first = pa.RecordBatch.from_pydict({"id": pa.array([1], type=pa.int32())})
+        duplicate = pa.RecordBatch.from_pydict({"id": pa.array([2, 1], type=pa.int32())})
+        writer.write_partition(0, [first])
+        with pytest.raises(RuntimeError):
+            writer.write_partition(1, [duplicate])
+
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'SELECT id FROM "{table}" ORDER BY id')
+            assert cur.fetchall() == [(1,)]
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+def test_postgres_retry_after_commit_is_at_least_once(pg_dsn):
+    import psycopg
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import PgWriteEngine
+
+    table = "wt_pg_partition_retry"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f'CREATE TABLE "{table}" (id INTEGER)')
+    try:
+        writer = PgWriteEngine(dsn=pg_dsn, dbtable=table, batch_size=1000)
+        batch = pa.RecordBatch.from_pydict({"id": pa.array([1], type=pa.int32())})
+        writer.write_partition(0, [batch])
+        writer.write_partition(0, [batch])
+
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'SELECT id FROM "{table}" ORDER BY id')
+            assert cur.fetchall() == [(1,), (1,)]
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+def test_write_overwrite_truncate_does_not_truncate_inheritance_children(spark, jdbc_opts, pg_dsn):
+    """PostgreSQL truncate paths must use ONLY, matching Spark's dialect SQL."""
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    parent = "wt_truncate_parent"
+    child = "wt_truncate_child"
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{child}"')
+        cur.execute(f'DROP TABLE IF EXISTS "{parent}" CASCADE')
+        cur.execute(f'CREATE TABLE "{parent}" (id INTEGER)')
+        cur.execute(f'CREATE TABLE "{child}" () INHERITS ("{parent}")')
+        cur.execute(f'INSERT INTO "{parent}" VALUES (1)')
+        cur.execute(f'INSERT INTO "{child}" VALUES (2)')
+    try:
+        spark.createDataFrame([(3,)], StructType([StructField("id", IntegerType())])).write.format("jdbc").option(
+            "dbtable", parent
+        ).option("sail.jdbc.overwriteMode", "truncate").options(**jdbc_opts).mode("overwrite").save()
+
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'SELECT id FROM ONLY "{parent}" ORDER BY id')
+            assert cur.fetchall() == [(3,)]
+            cur.execute(f'SELECT id FROM ONLY "{child}" ORDER BY id')
+            assert cur.fetchall() == [(2,)]
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            cur.execute(f'DROP TABLE IF EXISTS "{child}"')
+            cur.execute(f'DROP TABLE IF EXISTS "{parent}" CASCADE')
 
 
 @pytest.mark.parametrize("write_table", ["wt_truncate_overwrite"], indirect=True)

@@ -171,12 +171,13 @@ values) and need their DBAPI driver installed separately: `pip install pymysql`
 exact integers (including bigints above 2^53) and keeps `NULL` distinct from a
 numeric zero.
 
-For SQL Server, extra JDBC URL parameters (`;encrypt=...;trustServerCertificate=...;applicationIntent=...`)
-are parsed and mapped onto the pymssql connection: `encrypt` sets pymssql's
-`encryption` mode, `applicationIntent=ReadOnly` sets a read-only connection, and
-`trustServerCertificate` is accepted but ignored (FreeTDS, pymssql's backend,
-governs certificate trust through its own configuration). Unknown parameters are
-ignored.
+For SQL Server, `encrypt=true|false` is mapped onto pymssql's `encryption`
+mode, and `applicationIntent=ReadOnly` sets a read-only connection.
+Microsoft-JDBC-specific certificate properties such as
+`trustServerCertificate`, `hostNameInCertificate`, and `trustStore` are rejected:
+pymssql uses FreeTDS and cannot preserve those JDBC security semantics.
+`encrypt=strict` is also rejected instead of silently weakening it to an
+unencrypted connection.
 
 ```python
 (
@@ -198,8 +199,10 @@ ignored.
 - **overwrite** — by default, drops and recreates the target from the DataFrame
   schema before writing, matching Spark's built-in JDBC writer. For MySQL and
   SQL Server, `truncate=true` truncates instead, preserving the table schema and
-  metadata. Spark's PostgreSQL dialect does not support this optimization, so
-  PostgreSQL ignores `truncate=true` and still drops/recreates.
+  metadata. PostgreSQL also honors `truncate=true` and emits
+  `TRUNCATE TABLE ONLY`, preserving the target and avoiding truncation of
+  inheritance children. `cascadeTruncate=true` adds `CASCADE` for foreign-key
+  dependencies while retaining `ONLY`.
   - PostgreSQL also supports the Sail extension `sail.jdbc.overwriteMode=atomic`, which loads all
     partitions into one staging table, then swaps it over the target in a single
     `DROP; RENAME` transaction (replaces the table object, so grants/ACLs/RLS are
@@ -225,8 +228,10 @@ They are safe to drop manually.
 | ------------------------- | ------- | -------------------------------------------------- |
 | `dbtable`                 |         | Target table (required; `query` not allowed)       |
 | `truncate`                | `false` | Preserve table on MySQL/SQL Server overwrite       |
+| `cascadeTruncate`         | `false` | Cascade PostgreSQL truncate to FK dependencies     |
 | `sail.jdbc.overwriteMode` | —       | `atomic` or `truncate` (PostgreSQL overwrite only) |
 | `batchsize`               | `65536` | Rows per ingest call                               |
+| `numPartitions`           | —       | Maximum write partitions/concurrent DB connections |
 
 In explicit `append` or `overwrite` mode, a missing target is created from the
 DataFrame schema. PySpark's Python data-source API currently rejects the default

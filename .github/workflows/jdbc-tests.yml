@@ -32,6 +32,15 @@ jobs:
           python -m venv .venvs/spark-4.1.2-oracle
           "$SAIL_SPARK_4_1_2_PYTHON" -m pip install "pyspark==4.1.2"
 
+      - name: Report JDBC Test Stack
+        run: |
+          "$SAIL_SPARK_4_1_2_PYTHON" -c "import pyspark; print('oracle pyspark', pyspark.__version__)"
+          hatch run python -c "from importlib.metadata import version; [print(name, version(name)) for name in ('adbc-driver-postgresql', 'pymysql', 'pymssql', 'sqlalchemy', 'pyarrow')]"
+          echo "PostgreSQL JDBC org.postgresql:postgresql:42.7.7"
+          echo "MySQL JDBC com.mysql:mysql-connector-j:9.4.0"
+          echo "SQL Server JDBC com.microsoft.sqlserver:mssql-jdbc:12.10.2.jre11"
+          java -version
+
       - name: Run JDBC Integration Tests
         run: |
           hatch run pytest -m integration --pyargs \

@@ -323,6 +323,7 @@ def _build_where(filters: list[str]) -> str:
 
 _STAGING_PREFIX = "__sail_stg_"
 _TRUNC_SENTINEL_PREFIX = "__sail_trunc_"
+_POSTGRES_IDENTIFIER_BYTES = 63
 
 
 def _split_schema(qualified: str) -> tuple[str | None, str]:
@@ -335,19 +336,38 @@ def _split_schema(qualified: str) -> tuple[str | None, str]:
     return (schema, table) if sep else (None, qualified)
 
 
+def _postgres_generated_identifier(table: str, suffix: str) -> str:
+    """Append *suffix* without relying on PostgreSQL's unsafe server truncation."""
+    candidate = f"{table}{suffix}"
+    if len(candidate.encode()) <= _POSTGRES_IDENTIFIER_BYTES:
+        return candidate
+
+    import hashlib  # noqa: PLC0415
+
+    digest = hashlib.sha256(table.encode()).hexdigest()[:8]
+    tail = f"_{digest}{suffix}"
+    budget = _POSTGRES_IDENTIFIER_BYTES - len(tail.encode())
+    prefix = table.encode()[:budget]
+    while True:
+        try:
+            return f"{prefix.decode()}{tail}"
+        except UnicodeDecodeError:
+            prefix = prefix[:-1]
+
+
 def _staging_name_atomic(dbtable: str, run_id: str) -> str:
     """Per-run atomic staging table name, in the target's schema so the RENAME keeps
     it there. The run-id suffix isolates concurrent writers.
     """
     schema, table = _split_schema(dbtable)
-    staging = f"{table}{_STAGING_PREFIX}{run_id}"
+    staging = _postgres_generated_identifier(table, f"{_STAGING_PREFIX}{run_id}")
     return f"{schema}.{staging}" if schema else staging
 
 
 def _staging_name_truncate_sentinel(dbtable: str, run_id: str) -> str:
     """Return the per-run sentinel table name used by the truncate-mode advisory lock."""
     schema, table = _split_schema(dbtable)
-    sentinel = f"{table}{_TRUNC_SENTINEL_PREFIX}{run_id}"
+    sentinel = _postgres_generated_identifier(table, f"{_TRUNC_SENTINEL_PREFIX}{run_id}")
     return f"{schema}.{sentinel}" if schema else sentinel
 
 
@@ -369,6 +389,18 @@ def _owned_sequences(cur, dbtable: str) -> list[tuple[str, str]]:
         "FROM pg_depend dep "
         "JOIN pg_attribute att ON att.attrelid = dep.refobjid AND att.attnum = dep.refobjsubid "
         "WHERE dep.refobjid = to_regclass(%s) AND dep.classid = 'pg_class'::regclass AND dep.deptype = 'a'",
+        (dbtable,),
+    )
+    return [(row[0], row[1]) for row in cur.fetchall()]
+
+
+def _identity_sequences(cur, dbtable: str) -> list[tuple[str, str]]:
+    """Return identity sequences owned internally by columns of *dbtable*."""
+    cur.execute(
+        "SELECT dep.objid::regclass::text, att.attname "
+        "FROM pg_depend dep "
+        "JOIN pg_attribute att ON att.attrelid = dep.refobjid AND att.attnum = dep.refobjsubid "
+        "WHERE dep.refobjid = to_regclass(%s) AND dep.classid = 'pg_class'::regclass AND dep.deptype = 'i'",
         (dbtable,),
     )
     return [(row[0], row[1]) for row in cur.fetchall()]
@@ -445,6 +477,16 @@ class PgWriteEngine:
             msg = f"Failed to create atomic staging table {qstaging!r}: {safe_msg}"
             raise RuntimeError(msg) from e
 
+    def _cleanup_atomic_staging(self, staging: str) -> None:
+        import psycopg  # noqa: PLC0415
+
+        with (
+            contextlib.suppress(Exception),
+            psycopg.connect(self.dsn, autocommit=True) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute(f"DROP TABLE IF EXISTS {_quote_qualified(staging)}")
+
     def _prepare_truncate(self, qtarget: str) -> None:
         """Truncate the target exactly once using a distributed advisory lock.
 
@@ -470,7 +512,7 @@ class PgWriteEngine:
                 cur.execute(f"SELECT COUNT(*) FROM {qsentinel}")  # noqa: S608
                 row = cur.fetchone()
                 if row[0] == 0:  # type: ignore[index]
-                    cur.execute(f"TRUNCATE {qtarget}")
+                    cur.execute(f"TRUNCATE TABLE ONLY {qtarget}")
                     cur.execute(f"INSERT INTO {qsentinel} VALUES (TRUE)")  # noqa: S608
                 conn.commit()
         except Exception as e:
@@ -484,10 +526,9 @@ class PgWriteEngine:
 
     def write_partition(self, partition_id: int, batches: Iterable[pa.RecordBatch]) -> PartitionResult:
         """Write one partition. Returns a :class:`PartitionResult` for the driver."""
-        import adbc_driver_postgresql.dbapi as pg_dbapi  # noqa: PLC0415
+        import itertools  # noqa: PLC0415
 
-        collected = [b for b in batches if b.num_rows > 0]
-        table_obj = pa.Table.from_batches(collected) if collected else None
+        import adbc_driver_postgresql.dbapi as pg_dbapi  # noqa: PLC0415
 
         staging: str | None = None
 
@@ -502,22 +543,37 @@ class PgWriteEngine:
             target = self.dbtable
 
         rows = 0
-        if table_obj is not None and table_obj.num_rows > 0:
-            resolved = _resolve_column_names(
-                table_obj.column_names,
-                _pg_target_columns(self.dsn, self.dbtable),
-                case_sensitive=self.case_sensitive,
-            )
-            table_obj = table_obj.rename_columns(resolved)
+        nonempty = (batch for batch in batches if batch.num_rows > 0)
+        first = next(nonempty, None)
+        if first is not None:
+            try:
+                resolved = _resolve_column_names(
+                    first.schema.names,
+                    _pg_target_columns(self.dsn, self.dbtable),
+                    case_sensitive=self.case_sensitive,
+                )
+            except Exception:
+                if staging is not None:
+                    self._cleanup_atomic_staging(staging)
+                raise
             ingest_schema, ingest_table = _split_schema(target)
             try:
                 with pg_dbapi.connect(self.dsn) as conn:
                     with conn.cursor() as cur:
-                        for chunk in _iter_arrow_chunks(table_obj, self.batch_size):
-                            cur.adbc_ingest(ingest_table, chunk, mode="append", db_schema_name=ingest_schema)
+                        for batch in itertools.chain((first,), nonempty):
+                            table_obj = pa.Table.from_batches([batch]).rename_columns(resolved)
+                            for chunk in _iter_arrow_chunks(table_obj, self.batch_size):
+                                cur.adbc_ingest(
+                                    ingest_table,
+                                    chunk,
+                                    mode="append",
+                                    db_schema_name=ingest_schema,
+                                )
+                            rows += batch.num_rows
                     conn.commit()
-                rows = table_obj.num_rows
             except Exception as e:
+                if staging is not None:
+                    self._cleanup_atomic_staging(staging)
                 safe_msg = _safe_error(e, self.dsn)
                 msg = f"ADBC ingest failed for partition {partition_id} into {target!r}: {safe_msg}"
                 raise RuntimeError(msg) from e
@@ -552,6 +608,7 @@ class PgWriteEngine:
                         # Detach sequences OWNED BY the target (serial columns) so DROP is not
                         # refused, then re-own and re-sync them onto the swapped-in table.
                         owned = _owned_sequences(cur, self.dbtable)
+                        identities = _identity_sequences(cur, staging_name)
                         for seq, _ in owned:
                             cur.execute(f"ALTER SEQUENCE {seq} OWNED BY NONE")
                         cur.execute(f"DROP TABLE IF EXISTS {qtarget}")
@@ -559,6 +616,13 @@ class PgWriteEngine:
                         for seq, col in owned:
                             qcol = _quote_identifier(col)
                             cur.execute(f"ALTER SEQUENCE {seq} OWNED BY {qtarget}.{qcol}")
+                            cur.execute(
+                                f"SELECT setval(%s, COALESCE(MAX({qcol}), 1), MAX({qcol}) IS NOT NULL) "  # noqa: S608
+                                f"FROM {qtarget}",
+                                (seq,),
+                            )
+                        for seq, col in identities:
+                            qcol = _quote_identifier(col)
                             cur.execute(
                                 f"SELECT setval(%s, COALESCE(MAX({qcol}), 1), MAX({qcol}) IS NOT NULL) "  # noqa: S608
                                 f"FROM {qtarget}",
@@ -636,10 +700,11 @@ def _parse_sqlserver_url(rest: str) -> tuple[str, dict[str, object]]:
     Form: ``[user:pass@]host[\\instance][:port][;key=value[;...]]``. Known params:
     ``databaseName`` -> URL db segment; ``user``/``username`` and ``password`` -> URL
     userinfo (the common MS JDBC form, e.g. ``...;user=alice;password=s3cret``) when the
-    authority has none; ``encrypt`` -> ``encryption`` (require/off); ``applicationIntent=
-    ReadOnly`` -> ``read_only=True``. ``trustServerCertificate`` is accepted but ignored
-    (FreeTDS controls trust, not a per-connection flag). Unknown params are dropped
-    (pymssql would reject them).
+    authority has none; ``encrypt=true|false`` -> ``encryption`` (require/off);
+    ``applicationIntent=ReadOnly`` -> ``read_only=True``. Microsoft-JDBC-specific
+    certificate properties and unsupported encryption modes are rejected because
+    pymssql/FreeTDS cannot preserve their security semantics. Other unknown params
+    are dropped because pymssql would reject them.
     """
     from urllib.parse import quote  # noqa: PLC0415
 
@@ -653,6 +718,17 @@ def _parse_sqlserver_url(rest: str) -> tuple[str, dict[str, object]]:
                 continue
             key, _, value = raw.partition("=")
             params[key.strip().lower()] = value.strip()
+
+    unsupported_tls = {
+        "trustservercertificate": "trustServerCertificate",
+        "hostnameincertificate": "hostNameInCertificate",
+        "truststore": "trustStore",
+        "truststorepassword": "trustStorePassword",
+    }
+    for key, display_name in unsupported_tls.items():
+        if key in params:
+            msg = f"SQL Server JDBC property {display_name} is not supported by pymssql/FreeTDS."
+            raise ValueError(msg)
 
     database = params.get("databasename", "")
 
@@ -676,7 +752,11 @@ def _parse_sqlserver_url(rest: str) -> tuple[str, dict[str, object]]:
     connect_args: dict[str, object] = {}
     encrypt = params.get("encrypt")
     if encrypt is not None:
-        connect_args["encryption"] = "require" if encrypt.lower() == "true" else "off"
+        normalized = encrypt.lower()
+        if normalized not in {"true", "false"}:
+            msg = "SQL Server JDBC property encrypt must be true or false with the pymssql backend."
+            raise ValueError(msg)
+        connect_args["encryption"] = "require" if normalized == "true" else "off"
     if params.get("applicationintent", "").lower() == "readonly":
         connect_args["read_only"] = True
 
@@ -907,11 +987,12 @@ def _drop_pg_table(dsn: str, dbtable: str) -> None:
         cur.execute(f"DROP TABLE {_quote_qualified(dbtable)}")
 
 
-def _truncate_pg_table(dsn: str, dbtable: str) -> None:
+def _truncate_pg_table(dsn: str, dbtable: str, *, cascade: bool = False) -> None:
     import psycopg  # noqa: PLC0415
 
     with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(f"TRUNCATE TABLE {_quote_qualified(dbtable)}")
+        suffix = " CASCADE" if cascade else ""
+        cur.execute(f"TRUNCATE TABLE ONLY {_quote_qualified(dbtable)}{suffix}")
 
 
 def _create_sqlalchemy_table(url: str, connect_args: dict, dbtable: str, schema: pa.Schema) -> None:
@@ -1010,7 +1091,7 @@ class SqlAlchemyWriteEngine:
 
         return sa.Table(table_name, sa.MetaData(), schema=self.schema, autoload_with=engine)
 
-    def _insert_arrow(self, engine, sa_table, table_obj: pa.Table) -> None:
+    def _insert_arrow(self, engine, sa_table, table_obj: pa.Table, *, conn=None) -> None:
         """Insert an Arrow table via a parameterised INSERT, in ``batch_size`` chunks.
 
         *sa_table*'s column SQL types drive the bind (ints stay ints); ``to_pylist`` per
@@ -1026,9 +1107,16 @@ class SqlAlchemyWriteEngine:
             case_sensitive=self.case_sensitive,
         )
         table_obj = table_obj.rename_columns(resolved)
-        with engine.begin() as conn:
+
+        def insert_batches(connection) -> None:
             for chunk in _iter_arrow_chunks(table_obj, self.batch_size):
-                conn.execute(sa.insert(sa_table), chunk.to_pylist())
+                connection.execute(sa.insert(sa_table), chunk.to_pylist())
+
+        if conn is not None:
+            insert_batches(conn)
+        else:
+            with engine.begin() as transaction:
+                insert_batches(transaction)
 
     def _create_staging_like_target(self, engine, staging: str):
         """Create an empty staging table matching the target's columns; return its
@@ -1048,14 +1136,15 @@ class SqlAlchemyWriteEngine:
         return staging_table
 
     def write_partition(self, partition_id: int, batches: Iterable[pa.RecordBatch]) -> PartitionResult:
-        collected = [b for b in batches if b.num_rows > 0]
-        table_obj = pa.Table.from_batches(collected) if collected else None
+        import itertools  # noqa: PLC0415
 
         staging: str | None = None
         rows = 0
         engine = self._create_engine()
         try:
-            if table_obj is not None and table_obj.num_rows > 0:
+            nonempty = (batch for batch in batches if batch.num_rows > 0)
+            first = next(nonempty, None)
+            if first is not None:
                 if self.overwrite:
                     # Unique per call, not by partition_id (always 0 here — see _ArrowWriter):
                     # a shared name would let one partition drop another's staging mid-write.
@@ -1064,12 +1153,22 @@ class SqlAlchemyWriteEngine:
 
                     staging = self._staging(uuid.uuid4().hex[:12])
                     staging_table = self._create_staging_like_target(engine, staging)
-                    self._insert_arrow(engine, staging_table, table_obj)
+                    target_table = staging_table
                 else:
                     target_table = self._reflect_table(engine, self.table)
-                    self._insert_arrow(engine, target_table, table_obj)
-                rows = table_obj.num_rows
+                with engine.begin() as conn:
+                    for batch in itertools.chain((first,), nonempty):
+                        self._insert_arrow(
+                            engine,
+                            target_table,
+                            pa.Table.from_batches([batch]),
+                            conn=conn,
+                        )
+                        rows += batch.num_rows
         except Exception as e:
+            if staging is not None:
+                with contextlib.suppress(Exception):
+                    self._drop_stagings(engine, [staging], engine.dialect.identifier_preparer)
             safe_msg = _safe_error(e, self.url)
             msg = f"SQLAlchemy write failed for partition {partition_id} into {self.dbtable!r}: {safe_msg}"
             raise RuntimeError(msg) from e
@@ -1173,6 +1272,7 @@ class JdbcDataSourceWriter(_ArrowWriter):
         overwrite_mode: str,
         batch_size: int,
         case_sensitive: bool,
+        cascade_truncate: bool = False,
         run_id: str | None = None,
     ) -> None:
         self._conn_str = conn_str
@@ -1181,6 +1281,7 @@ class JdbcDataSourceWriter(_ArrowWriter):
         self._save_mode = save_mode
         self._overwrite_mode = overwrite_mode
         self._case_sensitive = case_sensitive
+        self._cascade_truncate = cascade_truncate
         super().__init__(
             PgWriteEngine(
                 dsn=conn_str,
@@ -1209,13 +1310,17 @@ class JdbcDataSourceWriter(_ArrowWriter):
                 _drop_pg_table(self._conn_str, self._dbtable)
                 _create_pg_table(self._conn_str, self._dbtable, self._schema)
             else:
+                if self._save_mode == "overwrite" and self._overwrite_mode == "truncate":
+                    _truncate_pg_table(
+                        self._conn_str,
+                        self._dbtable,
+                        cascade=self._cascade_truncate,
+                    )
                 _resolve_column_names(
                     list(self._schema.names),
                     _pg_target_columns(self._conn_str, self._dbtable),
                     case_sensitive=self._case_sensitive,
                 )
-                if self._save_mode == "overwrite" and self._overwrite_mode == "truncate":
-                    _truncate_pg_table(self._conn_str, self._dbtable)
             return "write"  # noqa: TRY300
         except Exception as e:
             if isinstance(e, (TypeError, ValueError)):
@@ -1279,18 +1384,24 @@ class SqlAlchemyDataSourceWriter(_ArrowWriter):
                 _create_sqlalchemy_table(self._url, self._connect_args, self._dbtable, self._schema)
             elif self._save_mode == "overwrite":
                 if self._truncate:
+                    _reset_sqlalchemy_table(
+                        self._url,
+                        self._connect_args,
+                        self._dbtable,
+                        truncate=True,
+                    )
                     _resolve_column_names(
                         list(self._schema.names),
                         _sqlalchemy_target_columns(self._url, self._connect_args, self._dbtable),
                         case_sensitive=self._case_sensitive,
                     )
-                _reset_sqlalchemy_table(
-                    self._url,
-                    self._connect_args,
-                    self._dbtable,
-                    truncate=self._truncate,
-                )
                 if not self._truncate:
+                    _reset_sqlalchemy_table(
+                        self._url,
+                        self._connect_args,
+                        self._dbtable,
+                        truncate=False,
+                    )
                     for field in self._schema:
                         _arrow_to_sqlalchemy_type(field.type, self._dialect)
                     _create_sqlalchemy_table(self._url, self._connect_args, self._dbtable, self._schema)
@@ -1563,10 +1674,23 @@ class JdbcDataSource(DataSource):
         user = opts.get("user") or None
         password = opts.get("password") or None
         conn_str = _jdbc_url_to_dsn(url, user, password)
-        batch_size = int(opts.get("batchsize", "65536"))
+        try:
+            batch_size = int(opts.get("batchsize", "65536"))
+        except ValueError:
+            msg = "Option 'batchsize' must be a positive integer."
+            raise ValueError(msg) from None
         if batch_size <= 0:
             msg = f"Option 'batchsize' must be a positive integer, got {batch_size}."
             raise ValueError(msg)
+        if "numpartitions" in opts:
+            try:
+                num_partitions = int(opts["numpartitions"])
+            except ValueError:
+                msg = "Option 'numPartitions' must be a positive integer."
+                raise ValueError(msg) from None
+            if num_partitions <= 0:
+                msg = f"Option 'numPartitions' must be a positive integer, got {num_partitions}."
+                raise ValueError(msg)
 
         import uuid  # noqa: PLC0415
 
@@ -1580,6 +1704,11 @@ class JdbcDataSource(DataSource):
             msg = f"Option 'truncate' must be 'true' or 'false', got {truncate_value!r}."
             raise ValueError(msg)
         truncate_requested = truncate_value == "true"
+        cascade_truncate_value = opts.get("cascadetruncate", "false").lower()
+        if cascade_truncate_value not in {"true", "false"}:
+            msg = f"Option 'cascadeTruncate' must be 'true' or 'false', got {cascade_truncate_value!r}."
+            raise ValueError(msg)
+        cascade_truncate = cascade_truncate_value == "true"
         case_sensitive = opts.get("__sail_case_sensitive", "false").lower() == "true"
         sail_overwrite_mode = opts.get("sail.jdbc.overwritemode")
         if sail_overwrite_mode is not None:
@@ -1598,7 +1727,9 @@ class JdbcDataSource(DataSource):
                 raise ValueError(msg)
 
         if subprotocol == "postgresql":
-            overwrite_mode = sail_overwrite_mode or ("spark" if overwrite else "append")
+            overwrite_mode = sail_overwrite_mode or (
+                "truncate" if overwrite and truncate_requested else "spark" if overwrite else "append"
+            )
             return JdbcDataSourceWriter(
                 conn_str=conn_str,
                 dbtable=dbtable,
@@ -1607,6 +1738,7 @@ class JdbcDataSource(DataSource):
                 overwrite_mode=overwrite_mode,
                 batch_size=batch_size,
                 case_sensitive=case_sensitive,
+                cascade_truncate=cascade_truncate,
                 run_id=run_id,
             )
 

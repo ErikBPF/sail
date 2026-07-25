@@ -37,6 +37,7 @@ def run_native_jdbc_write(
     rows: list[list[object]],
     mode: str | None,
     options: dict[str, str] | None = None,
+    select_exprs: list[str] | None = None,
 ) -> None:
     """Run one JDBC write in an isolated native Spark 4.1.2 process."""
     python = native_spark_4_1_2_python()
@@ -52,6 +53,7 @@ def run_native_jdbc_write(
         "rows": rows,
         "mode": mode,
         "options": options or {},
+        "select_exprs": select_exprs,
         "package": _DRIVER_PACKAGES[dialect],
         "driver": _DRIVER_CLASSES[dialect],
     }
@@ -70,7 +72,10 @@ spark = (SparkSession.builder.master("local[2]")
 try:
     if spark.version != "4.1.2":
         raise RuntimeError(f"Expected Spark 4.1.2, got {spark.version}")
-    df = spark.createDataFrame(payload["rows"], StructType.fromJson(payload["schema"]))
+    if payload["select_exprs"] is None:
+        df = spark.createDataFrame(payload["rows"], StructType.fromJson(payload["schema"]))
+    else:
+        df = spark.range(1).selectExpr(*payload["select_exprs"])
     writer = (df.write.format("jdbc")
               .option("url", payload["jdbc_url"])
               .option("dbtable", payload["dbtable"])
