@@ -27,6 +27,7 @@ use datafusion::physical_plan::{
 use datafusion_common::{DataFusionError, Result, internal_err};
 use futures::StreamExt;
 use futures::stream::once;
+use parquet::basic::{Compression, GzipLevel, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use sail_common_datafusion::catalog::{CatalogPartitionField, LakehouseExecutionContext};
 use sail_common_datafusion::datasource::PhysicalSinkMode;
@@ -54,6 +55,83 @@ use crate::utils::partition_transform::{
     catalog_partition_field_from_iceberg, format_partition_expr,
     iceberg_transform_from_partition_field, partition_field_name,
 };
+
+fn iceberg_writer_properties(
+    options: &IcebergWriterExecOptions,
+    table_properties: &[(String, String)],
+) -> Result<WriterProperties> {
+    let property = |name: &str| {
+        table_properties
+            .iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let level = options
+        .compression_level
+        .as_deref()
+        .or_else(|| property("write.parquet.compression-level"));
+    let codec = options
+        .compression_codec
+        .as_deref()
+        .or_else(|| property("write.parquet.compression-codec"))
+        .unwrap_or("zstd");
+    let compression = match codec.to_ascii_lowercase().as_str() {
+        "zstd" => Compression::ZSTD(match level {
+            Some(value) => ZstdLevel::try_new(value.parse().map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "Invalid write.parquet.compression-level {value:?} for zstd"
+                ))
+            })?)
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+            None => ZstdLevel::default(),
+        }),
+        "gzip" => Compression::GZIP(match level {
+            Some(value) => GzipLevel::try_new(value.parse().map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "Invalid write.parquet.compression-level {value:?} for gzip"
+                ))
+            })?)
+            .map_err(|error| DataFusionError::Plan(error.to_string()))?,
+            None => GzipLevel::default(),
+        }),
+        "snappy" if level.is_none() => Compression::SNAPPY,
+        "uncompressed" | "none" if level.is_none() => Compression::UNCOMPRESSED,
+        _ => {
+            return Err(DataFusionError::Plan(format!(
+                "Invalid write.parquet.compression-codec {codec:?}"
+            )));
+        }
+    };
+    Ok(WriterProperties::builder()
+        .set_compression(compression)
+        .build())
+}
+
+fn iceberg_target_file_size(
+    options: &IcebergWriterExecOptions,
+    table_properties: &[(String, String)],
+) -> Result<u64> {
+    if let Some(size) = options.target_file_size_bytes {
+        return (size > 0).then_some(size).ok_or_else(|| {
+            DataFusionError::Plan("target-file-size-bytes must be positive".into())
+        });
+    }
+    match table_properties
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "write.target-file-size-bytes")
+    {
+        Some((_, value)) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|size| *size > 0)
+            .ok_or_else(|| {
+                DataFusionError::Plan(format!("Invalid write.target-file-size-bytes {value:?}"))
+            }),
+        None => Ok(512 * 1024 * 1024),
+    }
+}
 
 #[derive(Debug)]
 pub struct IcebergWriterExec {
@@ -558,8 +636,8 @@ impl ExecutionPlan for IcebergWriterExec {
             let writer_config = WriterConfig {
                 table_schema: table_schema.clone(),
                 partition_columns: partition_columns.clone(),
-                writer_properties: WriterProperties::default(),
-                target_file_size: 134_217_728,
+                writer_properties: iceberg_writer_properties(&options, &options.table_properties)?,
+                target_file_size: iceberg_target_file_size(&options, &options.table_properties)?,
                 write_batch_size: 32 * 1024,
                 num_indexed_cols: 32,
                 stats_columns: None,
@@ -645,5 +723,99 @@ impl DisplayAs for IcebergWriterExec {
                 write!(f, "table_path={}", self.table_url)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use parquet::basic::Compression;
+    use parquet::schema::types::ColumnPath;
+
+    use super::{iceberg_target_file_size, iceberg_writer_properties};
+    use crate::physical_plan::writer_options::IcebergWriterExecOptions;
+
+    #[test]
+    fn iceberg_writer_defaults_to_zstd_compression() -> datafusion_common::Result<()> {
+        let properties = iceberg_writer_properties(&IcebergWriterExecOptions::default(), &[])?;
+
+        assert!(matches!(
+            properties.compression(&ColumnPath::new(vec!["id".to_string()])),
+            Compression::ZSTD(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn iceberg_writer_honors_parquet_compression_property() -> datafusion_common::Result<()> {
+        for (value, expected) in [
+            ("snappy", Compression::SNAPPY),
+            ("uncompressed", Compression::UNCOMPRESSED),
+        ] {
+            let properties = iceberg_writer_properties(
+                &IcebergWriterExecOptions::default(),
+                &[(
+                    "write.parquet.compression-codec".to_string(),
+                    value.to_string(),
+                )],
+            )?;
+
+            assert_eq!(
+                properties.compression(&ColumnPath::new(vec!["id".to_string()])),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn iceberg_writer_rejects_unknown_compression() {
+        let result = iceberg_writer_properties(
+            &IcebergWriterExecOptions::default(),
+            &[(
+                "write.parquet.compression-codec".to_string(),
+                "made-up".to_string(),
+            )],
+        );
+
+        assert!(matches!(
+            result,
+            Err(error) if error.to_string().contains("write.parquet.compression-codec")
+        ));
+    }
+
+    #[test]
+    fn iceberg_write_options_override_table_properties() -> datafusion_common::Result<()> {
+        let options = IcebergWriterExecOptions {
+            compression_codec: Some("snappy".to_string()),
+            target_file_size_bytes: Some(1024),
+            ..Default::default()
+        };
+        let table_properties = vec![
+            (
+                "write.parquet.compression-codec".to_string(),
+                "uncompressed".to_string(),
+            ),
+            (
+                "write.target-file-size-bytes".to_string(),
+                "2048".to_string(),
+            ),
+        ];
+
+        let properties = iceberg_writer_properties(&options, &table_properties)?;
+        assert_eq!(
+            properties.compression(&ColumnPath::new(vec!["id".to_string()])),
+            Compression::SNAPPY
+        );
+        assert_eq!(iceberg_target_file_size(&options, &table_properties)?, 1024);
+        Ok(())
+    }
+
+    #[test]
+    fn iceberg_target_file_size_defaults_to_spec_value() -> datafusion_common::Result<()> {
+        assert_eq!(
+            iceberg_target_file_size(&IcebergWriterExecOptions::default(), &[])?,
+            512 * 1024 * 1024
+        );
+        Ok(())
     }
 }

@@ -146,7 +146,21 @@ impl IcebergTableWriter {
             .map(Ok)
             .unwrap_or_else(|| self.new_partition_writer_state())?;
         let state = self.write_partition_state(state, batch).await?;
-        self.writers.insert(partition_dir, state);
+        let should_flush = matches!(
+            &state,
+            PartitionWriterState::Open { writer, .. }
+                if writer.estimated_size() as u64 >= self.config.target_file_size
+        );
+        self.writers.insert(partition_dir.clone(), state);
+        if should_flush {
+            let partition_values = self
+                .partition_values_map
+                .get(&partition_dir)
+                .cloned()
+                .unwrap_or_default();
+            self.flush_partition(&partition_dir, partition_values)
+                .await?;
+        }
         Ok(())
     }
 
@@ -382,5 +396,70 @@ impl IcebergTableWriter {
             return Ok(Some(array));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use parquet::file::properties::WriterProperties;
+    use sail_common_datafusion::variant::VariantShreddingConfig;
+    use url::Url;
+
+    use super::IcebergTableWriter;
+    use crate::datasource::type_converter::arrow_schema_to_iceberg;
+    use crate::operations::write::config::WriterConfig;
+    use crate::spec::partition::UnboundPartitionSpec;
+
+    #[test]
+    fn rolls_data_files_at_target_size() -> Result<(), String> {
+        futures::executor::block_on(async {
+            let field = Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "1".to_string(),
+            )]));
+            let schema = Arc::new(Schema::new(vec![field]));
+            let iceberg_schema =
+                Arc::new(arrow_schema_to_iceberg(&schema).map_err(|error| error.to_string())?);
+            let config = WriterConfig {
+                table_schema: Arc::clone(&schema),
+                partition_columns: vec![],
+                writer_properties: WriterProperties::default(),
+                target_file_size: 1,
+                write_batch_size: 32 * 1024,
+                num_indexed_cols: 32,
+                stats_columns: None,
+                iceberg_schema,
+                partition_spec: UnboundPartitionSpec { fields: vec![] },
+                variant_shredding: VariantShreddingConfig::default(),
+            };
+            let mut writer = IcebergTableWriter::new(
+                Arc::new(InMemory::new()),
+                Path::from("table"),
+                config,
+                0,
+                "data".to_string(),
+                Url::parse("memory:///table/").map_err(|error| error.to_string())?,
+            );
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .map_err(|error| error.to_string())?;
+
+            writer.write(&batch).await?;
+            writer.write(&batch).await?;
+            let files = writer.close().await?;
+
+            assert_eq!(files.len(), 2);
+            Ok(())
+        })
     }
 }
