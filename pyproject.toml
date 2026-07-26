@@ -68,7 +68,6 @@ jdbc = [
     "adbc-driver-manager>=1.0",
     "psycopg[binary]>=3.0",
     "sqlalchemy>=2.0",
-    "pandas>=2.0",
 ]
 vortex = [
     "vortex-data>=0.64; platform_system != 'Windows'",

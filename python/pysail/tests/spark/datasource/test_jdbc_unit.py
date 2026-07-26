@@ -95,8 +95,8 @@ def test_postgresql_connection_properties_map_to_libpq_and_url_wins():
 
     assert actual == (
         "postgresql://host/db?application_name=url-name&connect_timeout=9"
-        "&sslmode=verify-full&sslrootcert=%2Fcerts%2Froot+cert.pem"
-        "&options=-c+statement_timeout%3D5000"
+        "&sslmode=verify-full&sslrootcert=%2Fcerts%2Froot%20cert.pem"
+        "&options=-c%20statement_timeout%3D5000"
     )
 
 
@@ -107,6 +107,30 @@ def test_postgresql_connection_properties_are_case_insensitive():
         "postgresql://host/db",
         {"ApplicationName": "sail-review", "sslCert": "/tmp/client.pem", "sslKey": "/tmp/client.key"},
     ) == ("postgresql://host/db?application_name=sail-review&sslcert=%2Ftmp%2Fclient.pem&sslkey=%2Ftmp%2Fclient.key")
+
+
+def test_postgresql_jdbc_url_property_names_are_mapped_and_win():
+    from pysail.spark.datasource.jdbc import _postgresql_dsn_with_properties
+
+    assert (
+        _postgresql_dsn_with_properties(
+            "postgresql://host/db?ApplicationName=url-name&connectTimeout=4",
+            {"ApplicationName": "option-name", "connectTimeout": "9"},
+        )
+        == "postgresql://host/db?application_name=url-name&connect_timeout=4"
+    )
+
+
+def test_postgresql_query_timeout_preserves_existing_libpq_options():
+    from pysail.spark.datasource.jdbc import _postgresql_dsn_with_timeout
+
+    assert (
+        _postgresql_dsn_with_timeout(
+            "postgresql://host/db?options=-c+search_path%3Danalytics",
+            7,
+        )
+        == "postgresql://host/db?options=-c%20search_path%3Danalytics%20-c%20statement_timeout%3D7000"
+    )
 
 
 @pytest.mark.usefixtures("stub_target_exists")
@@ -441,6 +465,22 @@ def test_write_driver_accepts_native_class_and_rejects_custom_jvm_driver():
                 "driver": "com.example.CustomDriver",
             }
         ).writer(schema, overwrite=False)
+
+
+@pytest.mark.parametrize("option", ["keytab", "principal", "jaasApplicationName", "targetServerType"])
+def test_postgresql_writer_rejects_unhonored_driver_properties(option):
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    with pytest.raises(ValueError, match=option):
+        JdbcDataSource(
+            options={
+                "url": "jdbc:postgresql://localhost/db",
+                "dbtable": "t",
+                option: "value",
+            }
+        ).writer(pa.schema([("id", pa.int64())]), overwrite=False)
 
 
 @pytest.mark.parametrize("bad", ["0", "-1", "not-an-integer"])
@@ -844,10 +884,8 @@ def test_sqlserver_url_parsing_preserves_params():
     url4, _ = _parse_sqlserver_url("h\\inst:1433;databaseName=db")
     assert url4 == "mssql+pymssql://h\\inst:1433/db"
 
-    # Unknown params are ignored, not carried
-    _, ca5 = _parse_sqlserver_url("h:1433;databaseName=db;someFutureParam=x")
-    assert "somefutureparam" not in ca5
-    assert ca5 == {}
+    with pytest.raises(ValueError, match="someFutureParam"):
+        _parse_sqlserver_url("h:1433;databaseName=db;someFutureParam=x")
 
 
 def test_sqlserver_url_credentials_as_params():
@@ -904,6 +942,53 @@ def test_sqlserver_tls_rejection_redacts_parameter_password():
         _parse_sqlserver_url("h;databaseName=db;user=alice;password=topsecret;encrypt=strict")
 
     assert "topsecret" not in str(exc_info.value)
+
+
+def test_sqlalchemy_isolation_falls_back_when_driver_rejects(monkeypatch):
+    import sqlalchemy as sa
+
+    import pysail.spark.datasource.jdbc as jdbc
+
+    calls = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Engine:
+        def __init__(self, isolation):
+            self.isolation = isolation
+            self.disposed = False
+
+        def connect(self):
+            if self.isolation:
+                raise sa.exc.ArgumentError("unsupported isolation")
+            return Connection()
+
+        def dispose(self):
+            self.disposed = True
+
+    def create_engine(_url, **kwargs):
+        calls.append(kwargs.get("isolation_level"))
+        return Engine(kwargs.get("isolation_level"))
+
+    monkeypatch.setattr(sa, "create_engine", create_engine)
+    with pytest.warns(RuntimeWarning, match="driver default"):
+        engine = jdbc.SqlAlchemyWriteEngine(
+            url="mysql+pymysql://host/db",
+            dbtable="t",
+            columns=["id"],
+            overwrite=False,
+            batch_size=1000,
+            run_id="run",
+            isolation_level="SERIALIZABLE",
+        )._create_engine()  # noqa: SLF001
+
+    assert engine.isolation is None
+    assert calls == ["SERIALIZABLE", None]
 
 
 def test_write_options_no_url_raises():

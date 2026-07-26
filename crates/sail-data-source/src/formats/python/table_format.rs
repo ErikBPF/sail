@@ -10,7 +10,6 @@ use datafusion::catalog::Session;
 use datafusion::datasource::provider_as_source;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{Extension, LogicalPlan, TableSource, UserDefinedLogicalNode};
-use datafusion::physical_expr::Partitioning;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::{DFSchema, DFSchemaRef, Result, internal_err, plan_err};
@@ -20,7 +19,7 @@ use sail_common_datafusion::datasource::{
     OptionLayer, SinkInfo, SinkMode, SourceInfo, TableFormat, TableFormatRegistry,
 };
 use sail_common_datafusion::utils::items::ItemTaker;
-use sail_physical_plan::repartition::ExplicitRepartitionExec;
+use sail_physical_plan::coalesce::CoalesceExec;
 
 use super::datasource::PythonDataSource;
 use super::discovery::DATA_SOURCE_REGISTRY;
@@ -66,6 +65,18 @@ fn jdbc_write_num_partitions(
         return plan_err!("JDBC option 'numPartitions' must be a positive integer");
     }
     Ok(Some(value))
+}
+
+fn apply_jdbc_partition_limit(
+    input: Arc<dyn ExecutionPlan>,
+    partition_limit: Option<usize>,
+) -> Arc<dyn ExecutionPlan> {
+    match partition_limit {
+        Some(limit) if limit < input.properties().partitioning.partition_count() => {
+            Arc::new(CoalesceExec::new(input, limit))
+        }
+        _ => input,
+    }
 }
 
 /// TableFormat implementation for a Python data source.
@@ -393,13 +404,7 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
         let datasource = table_format.create_datasource(&opaque_options)?;
         let executor: Arc<dyn super::executor::PythonExecutor> =
             Arc::new(InProcessExecutor::from_app_config());
-        let input = match partition_limit {
-            Some(limit) if limit < input.properties().partitioning.partition_count() => Arc::new(
-                ExplicitRepartitionExec::new(input.clone(), Partitioning::RoundRobinBatch(limit)),
-            )
-                as Arc<dyn ExecutionPlan>,
-            _ => input.clone(),
-        };
+        let input = apply_jdbc_partition_limit(input.clone(), partition_limit);
         let schema = input.schema();
         let expected_partitions = input.properties().partitioning.partition_count();
         let writer_plan = executor
@@ -425,6 +430,11 @@ impl ExtensionPlanner for PythonPhysicalPlanner {
 
 #[cfg(test)]
 mod tests {
+    use datafusion::physical_expr::Partitioning;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::repartition::RepartitionExec;
+    use sail_physical_plan::coalesce::CoalesceExec;
+
     use super::*;
 
     #[test]
@@ -476,5 +486,22 @@ mod tests {
             let options = vec![("numPartitions".to_string(), value.to_string())];
             assert!(jdbc_write_num_partitions("jdbc", &options).is_err());
         }
+    }
+
+    #[test]
+    fn test_jdbc_partition_limit_uses_narrow_coalesce() -> Result<()> {
+        let schema = Arc::new(arrow_schema::Schema::empty());
+        let input: Arc<dyn ExecutionPlan> = Arc::new(RepartitionExec::try_new(
+            Arc::new(EmptyExec::new(schema)),
+            Partitioning::RoundRobinBatch(4),
+        )?);
+
+        let limited = apply_jdbc_partition_limit(input, Some(2));
+        let coalesce = limited
+            .downcast_ref::<CoalesceExec>()
+            .ok_or_else(|| datafusion_common::exec_datafusion_err!("expected CoalesceExec"))?;
+
+        assert_eq!(coalesce.output_partitions(), 2);
+        Ok(())
     }
 }

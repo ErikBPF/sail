@@ -133,12 +133,28 @@ def _postgresql_dsn_with_properties(dsn: str, options: dict[str, str]) -> str:
     }
     normalized = {key.lower(): value for key, value in options.items()}
     parts = urlsplit(dsn)
-    query = list(parse_qsl(parts.query, keep_blank_values=True))
+    query = [(names.get(key.lower(), key), value) for key, value in parse_qsl(parts.query, keep_blank_values=True)]
     present = {key.lower() for key, _ in query}
     for source, target in names.items():
         if source in normalized and target.lower() not in present:
             query.append((target, normalized[source]))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, quote_via=quote), parts.fragment))
+
+
+def _postgresql_dsn_with_timeout(dsn: str, query_timeout: int) -> str:
+    if not query_timeout:
+        return dsn
+    parts = urlsplit(dsn)
+    query = list(parse_qsl(parts.query, keep_blank_values=True))
+    timeout = f"-c statement_timeout={query_timeout * 1000}"
+    for index in range(len(query) - 1, -1, -1):
+        key, value = query[index]
+        if key.lower() == "options":
+            query[index] = (key, f"{value} {timeout}".strip())
+            break
+    else:
+        query.append(("options", timeout))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, quote_via=quote), parts.fragment))
 
 
 # ============================================================================
@@ -750,12 +766,15 @@ def _parse_sqlserver_url(rest: str) -> tuple[str, dict[str, object]]:
     userinfo, host, instance, port = _split_sqlserver_authority(authority)
 
     params: dict[str, str] = {}
+    param_names: dict[str, str] = {}
     if param_str:
         for raw in param_str.split(";"):
             if not raw.strip():
                 continue
             key, _, value = raw.partition("=")
-            params[key.strip().lower()] = value.strip()
+            normalized = key.strip().lower()
+            params[normalized] = value.strip()
+            param_names[normalized] = key.strip()
 
     unsupported_tls = {
         "trustservercertificate": "trustServerCertificate",
@@ -767,6 +786,10 @@ def _parse_sqlserver_url(rest: str) -> tuple[str, dict[str, object]]:
         if key in params:
             msg = f"SQL Server JDBC property {display_name} is not supported by pymssql/FreeTDS."
             raise ValueError(msg)
+    supported = {"databasename", "user", "username", "password", "encrypt", "applicationintent"}
+    if unknown := next((key for key in params if key not in supported), None):
+        msg = f"SQL Server JDBC property {param_names[unknown]} is not supported by pymssql/FreeTDS."
+        raise ValueError(msg)
 
     database = params.get("databasename", "")
 
@@ -1114,14 +1137,10 @@ def _validate_pg_create_schema(schema: pa.Schema) -> None:
             raise TypeError(msg)
 
 
-def _pg_timeout_kwargs(query_timeout: int) -> dict[str, str]:
-    return {"options": f"-c statement_timeout={query_timeout * 1000}"} if query_timeout else {}
-
-
 def _pg_table_exists(dsn: str, dbtable: str, query_timeout: int = 0) -> bool:
     import psycopg  # noqa: PLC0415
 
-    with psycopg.connect(dsn, **_pg_timeout_kwargs(query_timeout)) as conn, conn.cursor() as cur:
+    with psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout)) as conn, conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s)", (dbtable,))
         return cur.fetchone()[0] is not None  # type: ignore[index]
 
@@ -1143,7 +1162,7 @@ def _resolve_column_names(source: list[str], target: list[str], *, case_sensitiv
 def _pg_target_columns(dsn: str, dbtable: str, query_timeout: int = 0) -> list[str]:
     import psycopg  # noqa: PLC0415
 
-    with psycopg.connect(dsn, **_pg_timeout_kwargs(query_timeout)) as conn, conn.cursor() as cur:
+    with psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout)) as conn, conn.cursor() as cur:
         # Identifiers are parsed and quoted by _quote_qualified; query values are not interpolated.
         cur.execute(f"SELECT * FROM {_quote_qualified(dbtable)} LIMIT 0")  # noqa: S608
         return [column.name for column in cur.description or ()]
@@ -1191,7 +1210,10 @@ def _create_pg_table(
     if options or column_types:
         import psycopg  # noqa: PLC0415
 
-        with psycopg.connect(dsn, autocommit=True, **_pg_timeout_kwargs(query_timeout)) as conn, conn.cursor() as cur:
+        with (
+            psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout), autocommit=True) as conn,
+            conn.cursor() as cur,
+        ):
             cur.execute(_create_table_sql(dbtable, schema, "postgresql", options, column_types, case_sensitive))
     else:
         import adbc_driver_postgresql.dbapi as pg_dbapi  # noqa: PLC0415
@@ -1207,7 +1229,7 @@ def _create_pg_table(
 
         try:
             with (
-                psycopg.connect(dsn, autocommit=True, **_pg_timeout_kwargs(query_timeout)) as conn,
+                psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout), autocommit=True) as conn,
                 conn.cursor() as cur,
             ):
                 cur.execute(
@@ -1223,14 +1245,20 @@ def _drop_pg_table(dsn: str, dbtable: str, query_timeout: int = 0) -> None:
     """Drop an existing PostgreSQL target before Spark-style overwrite."""
     import psycopg  # noqa: PLC0415
 
-    with psycopg.connect(dsn, autocommit=True, **_pg_timeout_kwargs(query_timeout)) as conn, conn.cursor() as cur:
+    with (
+        psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout), autocommit=True) as conn,
+        conn.cursor() as cur,
+    ):
         cur.execute(f"DROP TABLE {_quote_qualified(dbtable)}")
 
 
 def _truncate_pg_table(dsn: str, dbtable: str, *, cascade: bool = False, query_timeout: int = 0) -> None:
     import psycopg  # noqa: PLC0415
 
-    with psycopg.connect(dsn, autocommit=True, **_pg_timeout_kwargs(query_timeout)) as conn, conn.cursor() as cur:
+    with (
+        psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout), autocommit=True) as conn,
+        conn.cursor() as cur,
+    ):
         suffix = " CASCADE" if cascade else ""
         cur.execute(f"TRUNCATE TABLE ONLY {_quote_qualified(dbtable)}{suffix}")
 
@@ -1365,12 +1393,30 @@ class SqlAlchemyWriteEngine:
         # Short-lived, single-connection engine — skip the connection pool.
         isolation = "AUTOCOMMIT" if self.isolation_level == "NONE" else self.isolation_level.replace("_", " ")
         connect_args = _timeout_connect_args(self.url, self.connect_args, self.query_timeout)
-        return sa.create_engine(
+        engine = sa.create_engine(
             self.url,
             poolclass=NullPool,
             connect_args=connect_args,
             isolation_level=isolation,
         )
+        try:
+            with engine.connect():
+                pass
+        except (sa.exc.ArgumentError, NotImplementedError):
+            import warnings  # noqa: PLC0415
+
+            engine.dispose()
+            warnings.warn(
+                f"Requested isolation level {self.isolation_level} is unsupported; using driver default.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            engine = sa.create_engine(
+                self.url,
+                poolclass=NullPool,
+                connect_args=connect_args,
+            )
+        return engine
 
     def _staging(self, token: str) -> str:
         return f"{self.table}{_STAGING_PREFIX}{self.run_id}_{token}"
@@ -2022,6 +2068,36 @@ class JdbcDataSource(DataSource):
             msg = "Option 'url' is required for the jdbc data source"
             raise ValueError(msg)
         subprotocol = url[5:].split("://", 1)[0].split(":", 1)[0] if url.startswith("jdbc:") else ""
+        if subprotocol == "postgresql":
+            supported = {
+                "url",
+                "dbtable",
+                "user",
+                "password",
+                "driver",
+                "batchsize",
+                "numpartitions",
+                "truncate",
+                "cascadetruncate",
+                "isolationlevel",
+                "querytimeout",
+                "createtableoptions",
+                "createtablecolumntypes",
+                "tablecomment",
+                "sail.jdbc.overwritemode",
+                "applicationname",
+                "connecttimeout",
+                "sslmode",
+                "sslcert",
+                "sslkey",
+                "sslrootcert",
+                "options",
+                "__sail_save_mode",
+                "__sail_case_sensitive",
+            }
+            if unsupported := next((key for key in self.options if key.lower() not in supported), None):
+                msg = f"PostgreSQL JDBC property {unsupported} has no equivalent in Sail's native client."
+                raise ValueError(msg)
         driver = opts.get("driver")
         native_drivers = {
             "postgresql": {"org.postgresql.Driver"},
