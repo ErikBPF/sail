@@ -804,6 +804,139 @@ def test_postgres_dbtable_whitespace_matches_native_spark_4_1_2(spark, jdbc_opts
 
 
 @pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_create_options_match_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    import psycopg
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    tables = ("wt_pg_native_create_options", "wt_pg_sail_create_options")
+    schema = StructType([StructField("id", IntegerType()), StructField("label", StringType())])
+    options = {
+        "createTableColumnTypes": "LABEL VARCHAR(32)",
+        "createTableOptions": "WITH (fillfactor=70)",
+        "tableComment": "spark parity evidence",
+        "isolationLevel": "SERIALIZABLE",
+        "queryTimeout": "10",
+    }
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in tables:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+    try:
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=tables[0],
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=[[1, "one"]],
+            mode="append",
+            options=options,
+        )
+        spark.createDataFrame([(1, "one")], schema).write.format("jdbc").option("dbtable", tables[1]).options(
+            **jdbc_opts, **options
+        ).mode("append").save()
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            snapshots = []
+            for table in tables:
+                cur.execute(
+                    "SELECT character_maximum_length FROM information_schema.columns "
+                    "WHERE table_name = %s AND column_name = 'label'",
+                    (table,),
+                )
+                length = cur.fetchone()[0]
+                cur.execute("SELECT reloptions, obj_description(oid) FROM pg_class WHERE oid = %s::regclass", (table,))
+                snapshots.append((length, *cur.fetchone()))
+            assert snapshots[0] == snapshots[1] == (32, ["fillfactor=70"], "spark parity evidence")
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_isolation_and_timeout_match_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    schema = StructType([StructField("id", IntegerType())])
+    isolation_tables = ("wt_pg_native_isolation", "wt_pg_sail_isolation")
+    timeout_tables = ("wt_pg_native_timeout", "wt_pg_sail_timeout")
+    all_tables = (*isolation_tables, *timeout_tables)
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(
+            "CREATE OR REPLACE FUNCTION wt_pg_record_isolation() RETURNS trigger LANGUAGE plpgsql AS "
+            "$$ BEGIN NEW.level := current_setting('transaction_isolation'); RETURN NEW; END $$"
+        )
+        cur.execute(
+            "CREATE OR REPLACE FUNCTION wt_pg_sleep() RETURNS trigger LANGUAGE plpgsql AS "
+            "$$ BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$"
+        )
+        for table in isolation_tables:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'CREATE TABLE "{table}" (id INTEGER, level TEXT)')
+            cur.execute(
+                f'CREATE TRIGGER "{table}_trigger" BEFORE INSERT ON "{table}" '  # noqa: S608
+                "FOR EACH ROW EXECUTE FUNCTION wt_pg_record_isolation()"
+            )
+        for table in timeout_tables:
+            cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute(f'CREATE TABLE "{table}" (id INTEGER)')
+            cur.execute(
+                f'CREATE TRIGGER "{table}_trigger" BEFORE INSERT ON "{table}" '  # noqa: S608
+                "FOR EACH ROW EXECUTE FUNCTION wt_pg_sleep()"
+            )
+    try:
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=isolation_tables[0],
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=[[1]],
+            mode="append",
+            options={"isolationLevel": "SERIALIZABLE"},
+        )
+        spark.createDataFrame([(1,)], schema).write.format("jdbc").option("dbtable", isolation_tables[1]).options(
+            **jdbc_opts, isolationLevel="SERIALIZABLE"
+        ).mode("append").save()
+        for table, native in zip(timeout_tables, (True, False), strict=True):
+            with pytest.raises(Exception) as failure:  # noqa: B017
+                if native:
+                    run_native_jdbc_write(
+                        dialect="postgresql",
+                        jdbc_url=jdbc_opts["url"],
+                        dbtable=table,
+                        user=jdbc_opts["user"],
+                        password=jdbc_opts["password"],
+                        schema_json=schema.jsonValue(),
+                        rows=[[1]],
+                        mode="append",
+                        options={"queryTimeout": "1"},
+                    )
+                else:
+                    spark.createDataFrame([(1,)], schema).write.format("jdbc").option("dbtable", table).options(
+                        **jdbc_opts, queryTimeout="1"
+                    ).mode("append").save()
+            assert failure.value is not None
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                f'SELECT level FROM "{isolation_tables[0]}" UNION ALL '  # noqa: S608
+                f'SELECT level FROM "{isolation_tables[1]}" ORDER BY level'
+            )
+            assert cur.fetchall() == [("serializable",), ("serializable",)]
+            for table in timeout_tables:
+                cur.execute(f'SELECT count(*) FROM "{table}"')  # noqa: S608
+                assert cur.fetchone()[0] == 0
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            for table in all_tables:
+                cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+            cur.execute("DROP FUNCTION IF EXISTS wt_pg_record_isolation()")
+            cur.execute("DROP FUNCTION IF EXISTS wt_pg_sleep()")
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
 def test_postgres_reordered_case_varied_append_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
     import psycopg
     from pyspark.sql.types import IntegerType, StringType, StructField, StructType

@@ -230,9 +230,19 @@ They are safe to drop manually.
 | `truncate`                | `false` | Preserve table on MySQL/SQL Server overwrite       |
 | `cascadeTruncate`         | `false` | Cascade PostgreSQL truncate to FK dependencies     |
 | `sail.jdbc.overwriteMode` | —       | `atomic` or `truncate` (PostgreSQL overwrite only) |
-| `batchsize`               | `65536` | Rows per ingest call                               |
+| `batchsize`               | `1000`  | Rows per ingest call                               |
 | `numPartitions`           | —       | Maximum write partitions/concurrent DB connections |
+| `isolationLevel`          | `READ_UNCOMMITTED` | `NONE`, `READ_UNCOMMITTED`, `READ_COMMITTED`, `REPEATABLE_READ`, or `SERIALIZABLE` |
+| `queryTimeout`            | `0`     | Statement/driver timeout in seconds; `0` disables it |
+| `createTableColumnTypes`  | —       | Spark DDL type overrides for selected columns      |
+| `createTableOptions`      | —       | Dialect DDL appended when a target is created      |
+| `tableComment`            | —       | Best-effort table comment, matching Spark behavior |
+| `driver`                  | —       | Native driver class is accepted; custom JVM drivers are rejected |
 
 In explicit `append` or `overwrite` mode, a missing target is created from the
 DataFrame schema. PySpark's Python data-source API currently rejects the default
 `errorIfExists` mode before the JDBC writer runs, so specify a mode explicitly.
+
+`createTableOptions` is trusted raw database DDL, as it is in Spark. Do not build
+it from untrusted input. It is used only while creating a missing table or
+recreating one during default overwrite.

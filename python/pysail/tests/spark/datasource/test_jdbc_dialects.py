@@ -622,6 +622,45 @@ def test_mysql_created_types_match_spark_4_1(spark, mysql_ctx):
         _drop_table(sa_url, table)
 
 
+def test_mysql_create_options_and_comment(spark, mysql_ctx):
+    import sqlalchemy as sa
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    opts, sa_url = mysql_ctx
+    table = "wt_mysql_create_options"
+    _drop_table(sa_url, table)
+    try:
+        schema = StructType([StructField("id", IntegerType()), StructField("label", StringType())])
+        spark.createDataFrame([(1, "one")], schema).write.format("jdbc").option("dbtable", table).options(
+            **opts,
+            createTableColumnTypes="LABEL VARCHAR(32)",
+            createTableOptions="ENGINE=InnoDB",
+            tableComment="spark parity evidence",
+            isolationLevel="SERIALIZABLE",
+            queryTimeout="10",
+        ).mode("append").save()
+        engine = sa.create_engine(sa_url)
+        with engine.connect() as conn:
+            row = conn.execute(
+                sa.text(
+                    "SELECT ENGINE, TABLE_COMMENT FROM information_schema.tables "
+                    "WHERE table_schema = DATABASE() AND table_name = :table"
+                ),
+                {"table": table},
+            ).one()
+            length = conn.execute(
+                sa.text(
+                    "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = :table AND column_name = 'label'"
+                ),
+                {"table": table},
+            ).scalar_one()
+        engine.dispose()
+        assert (row[0].lower(), row[1], length) == ("innodb", "spark parity evidence", 32)
+    finally:
+        _drop_table(sa_url, table)
+
+
 @pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
 def test_mysql_write_matches_native_spark_4_1_2(spark, mysql_ctx):
     opts, sa_url = mysql_ctx
@@ -969,6 +1008,45 @@ def test_mssql_created_types_match_spark_4_1(spark, mssql_ctx):
         # SQLAlchemy's pymssql inspector omits the MAX length marker.
         assert types["payload"] == "varbinary"
         assert types["created_at"] == "datetime"
+    finally:
+        _drop_table(sa_url, table)
+
+
+def test_mssql_create_options_and_comment(spark, mssql_ctx):
+    import sqlalchemy as sa
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
+
+    opts, sa_url = mssql_ctx
+    table = "wt_mssql_create_options"
+    _drop_table(sa_url, table)
+    try:
+        schema = StructType([StructField("id", IntegerType()), StructField("label", StringType())])
+        spark.createDataFrame([(1, "one")], schema).write.format("jdbc").option("dbtable", table).options(
+            **opts,
+            createTableColumnTypes="LABEL VARCHAR(32)",
+            createTableOptions="ON [PRIMARY]",
+            tableComment="spark parity evidence",
+            isolationLevel="SERIALIZABLE",
+            queryTimeout="10",
+        ).mode("append").save()
+        engine = sa.create_engine(sa_url)
+        with engine.connect() as conn:
+            length = conn.execute(
+                sa.text(
+                    "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns "
+                    "WHERE table_name = :table AND column_name = 'label'"
+                ),
+                {"table": table},
+            ).scalar_one()
+            comment = conn.execute(
+                sa.text(
+                    "SELECT CAST(value AS NVARCHAR(MAX)) FROM sys.extended_properties "
+                    "WHERE major_id = OBJECT_ID(:table) AND name = 'MS_Description'"
+                ),
+                {"table": table},
+            ).scalar_one()
+        engine.dispose()
+        assert (length, comment) == (32, "spark parity evidence")
     finally:
         _drop_table(sa_url, table)
 

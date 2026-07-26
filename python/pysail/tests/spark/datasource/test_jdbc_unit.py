@@ -274,6 +274,64 @@ def test_arrow_to_sqlalchemy_type_mapping():
         _arrow_to_sqlalchemy_type(pa.struct([("x", pa.int32())]), "mssql")
 
 
+@pytest.mark.parametrize(
+    ("dialect", "suffix"),
+    [("postgresql", "WITH (fillfactor=70)"), ("mysql", "ENGINE=InnoDB"), ("mssql", "ON [PRIMARY]")],
+)
+def test_create_table_options_are_appended_to_dialect_ddl(dialect, suffix):
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _create_table_sql
+
+    sql = _create_table_sql("public.events", pa.schema([("id", pa.int32())]), dialect, suffix)
+    assert sql.endswith(f" {suffix}")
+    assert "id" in sql
+
+
+def test_create_table_column_types_override_selected_columns():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _create_table_sql
+
+    sql = _create_table_sql(
+        "events",
+        pa.schema([("id", pa.int32()), ("label", pa.string())]),
+        "postgresql",
+        column_types="LABEL VARCHAR(32), id DECIMAL(20, 0)",
+    )
+    assert "label VARCHAR(32)" in sql
+    assert "id NUMERIC(20, 0)" in sql
+
+
+def test_create_table_column_types_support_quoted_names_and_postgres_arrays():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _create_table_sql
+
+    sql = _create_table_sql(
+        "events",
+        pa.schema([("display label", pa.string()), ("tags", pa.list_(pa.int32()))]),
+        "postgresql",
+        column_types="`display label` CHAR(8), tags ARRAY<STRING>",
+    )
+    assert '"display label" CHAR(8)' in sql
+    assert "tags TEXT[]" in sql
+
+
+def test_create_table_column_types_reject_duplicates():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _create_table_sql
+
+    with pytest.raises(ValueError, match="duplicate"):
+        _create_table_sql(
+            "events",
+            pa.schema([("id", pa.int32())]),
+            "postgresql",
+            column_types="id INT, ID BIGINT",
+        )
+
+
 @pytest.mark.parametrize("bad", ["0", "-1", "not-an-integer"])
 def test_write_batchsize_must_be_positive(bad):
     """writer() rejects a non-positive batchsize on the driver, before fan-out.
@@ -289,6 +347,50 @@ def test_write_batchsize_must_be_positive(bad):
     ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "t", "batchsize": bad})
     with pytest.raises(ValueError, match="batchsize"):
         ds.writer(schema, overwrite=False)
+
+
+@pytest.mark.usefixtures("stub_target_exists")
+def test_write_batchsize_default_matches_spark():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost/db", "dbtable": "t"})
+    assert ds.writer(pa.schema([("id", pa.int64())]), overwrite=False)._engine.batch_size == 1000  # noqa: SLF001
+
+
+@pytest.mark.parametrize("option", ["isolationLevel", "queryTimeout"])
+def test_invalid_transaction_options_fail_before_fanout(option):
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost/db", "dbtable": "t", option: "invalid"})
+    with pytest.raises(ValueError, match=option):
+        ds.writer(pa.schema([("id", pa.int64())]), overwrite=False)
+
+
+def test_write_driver_accepts_native_class_and_rejects_custom_jvm_driver():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    schema = pa.schema([("id", pa.int64())])
+    JdbcDataSource(
+        options={
+            "url": "jdbc:postgresql://localhost/db",
+            "dbtable": "t",
+            "driver": "org.postgresql.Driver",
+        }
+    ).writer(schema, overwrite=False)
+    with pytest.raises(ValueError, match="driver"):
+        JdbcDataSource(
+            options={
+                "url": "jdbc:postgresql://localhost/db",
+                "dbtable": "t",
+                "driver": "com.example.CustomDriver",
+            }
+        ).writer(schema, overwrite=False)
 
 
 @pytest.mark.parametrize("bad", ["0", "-1", "not-an-integer"])
@@ -369,6 +471,9 @@ def test_postgres_adbc_ingest_calls_respect_batchsize(monkeypatch):
         def __exit__(self, *_args):
             return False
 
+        def execute(self, _sql):
+            pass
+
         def adbc_ingest(self, _table, chunk, **_kwargs):
             ingested.append(chunk.num_rows)
 
@@ -395,6 +500,48 @@ def test_postgres_adbc_ingest_calls_respect_batchsize(monkeypatch):
     writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": range(5)})])
 
     assert ingested == [2, 2, 1]
+
+
+def test_postgres_partition_applies_isolation_and_query_timeout(monkeypatch):
+    import adbc_driver_postgresql.dbapi as pg_dbapi
+    import pyarrow as pa
+
+    from pysail.spark.datasource import jdbc
+
+    statements = []
+
+    class Resource:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql):
+            statements.append(sql)
+
+        def adbc_ingest(self, *_args, **_kwargs):
+            pass
+
+        def commit(self):
+            pass
+
+    monkeypatch.setattr(pg_dbapi, "connect", lambda *_a, **_k: Resource())
+    monkeypatch.setattr(jdbc, "_pg_target_columns", lambda *_a, **_k: ["id"])
+    writer = jdbc.PgWriteEngine(
+        dsn="postgresql://unused",
+        dbtable="t",
+        isolation_level="SERIALIZABLE",
+        query_timeout=7,
+    )
+    writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
+    assert statements == [
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET statement_timeout = 7000",
+    ]
 
 
 def test_sqlalchemy_writer_streams_before_requesting_next_batch(tmp_path):
@@ -451,6 +598,9 @@ def test_postgres_writer_streams_before_requesting_next_batch(monkeypatch):
 
         def __exit__(self, *_args):
             return False
+
+        def execute(self, _sql):
+            pass
 
         def adbc_ingest(self, _table, chunk, **_kwargs):
             ingested.extend(chunk["id"].to_pylist())
