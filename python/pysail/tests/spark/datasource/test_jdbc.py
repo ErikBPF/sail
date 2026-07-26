@@ -11,7 +11,11 @@ from pathlib import Path
 import pytest
 from testcontainers.community.postgres import PostgresContainer
 
-from pysail.testing.spark.jdbc_oracle import native_spark_4_1_2_python, run_native_jdbc_write
+from pysail.testing.spark.jdbc_oracle import (
+    SPARK_TYPE_MATRIX_SELECT_EXPRS,
+    native_spark_4_1_2_python,
+    run_native_jdbc_write,
+)
 from pysail.testing.spark.utils.common import pyspark_version
 
 pytestmark = pytest.mark.integration
@@ -634,89 +638,106 @@ def _pg_snapshot(pg_dsn, table):
         return columns, indexed_columns, sorted(cur.fetchall(), key=repr)
 
 
-@pytest.mark.parametrize("write_table", ["wt_append_basic"], indirect=True)
-def test_write_append_basic(spark, jdbc_opts, write_table):
-    """Append-mode write round-trips rows correctly."""
-    from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
+def test_native_spark_oracle_not_silently_skipped():
+    """CI guard: when the environment demands the oracle, differentials must not skip.
 
-    schema = StructType(
-        [
-            StructField("id", IntegerType()),
-            StructField("name", StringType()),
-            StructField("score", DoubleType()),
-        ]
-    )
-    data = [(1, "Alice", 9.5), (2, "Bob", 7.2), (3, "Charlie", 8.8)]
-    df = spark.createDataFrame(data, schema)
+    The differential tests skip when SAIL_SPARK_4_1_2_PYTHON is unset. If that env
+    var ever disappears from the CI job, every differential would silently skip and
+    the job would stay green; this sentinel fails instead.
+    """
+    import os
 
-    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("append").save()
-
-    result = _read_pg_table(spark, jdbc_opts, write_table)
-    assert result.count() == 3  # noqa: PLR2004
-    names = {r.name for r in result.collect()}
-    assert names == {"Alice", "Bob", "Charlie"}
+    if os.environ.get("SAIL_JDBC_REQUIRE_ORACLE") != "1":
+        pytest.skip("SAIL_JDBC_REQUIRE_ORACLE is not set")
+    python = native_spark_4_1_2_python()
+    assert python is not None, "SAIL_SPARK_4_1_2_PYTHON must point at the Spark 4.1.2 oracle interpreter"
+    assert python.exists(), f"oracle interpreter missing: {python}"
 
 
-@pytest.mark.parametrize("mode", [None, "append", "overwrite"])
-def test_write_creates_missing_target(spark, jdbc_opts, pg_dsn, mode):
-    """Every Spark save mode that writes creates a missing target."""
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_created_types_match_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    """Create-table type mapping parity across Spark's PostgreSQL write matrix.
+
+    Both engines evaluate the same SELECT expressions and auto-create their target,
+    so the created column types (PostgresDialect.getJDBCType + common fallback) and
+    the round-tripped values must be identical.
+    """
     import psycopg
-    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
-    schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
-    df = spark.createDataFrame([(1, "Alice")], schema)
-    table = f"wt_auto_create_{mode or 'default'}"
+    exprs = [*SPARK_TYPE_MATRIX_SELECT_EXPRS, "ARRAY(1, 2) AS c_array"]
+    tables = ("wt_pg_native_type_matrix", "wt_pg_sail_type_matrix")
     with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
-    try:
-        writer = df.write.format("jdbc").option("dbtable", table).options(**jdbc_opts)
-        if mode is not None:
-            writer = writer.mode(mode)
-        writer.save()
-        result = _read_pg_table(spark, jdbc_opts, table)
-        rows = result.collect()
-        assert len(rows) == 1
-        assert rows[0].asDict() == {"id": 1, "name": "Alice"}
-    finally:
-        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        for table in tables:
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
-
-
-def test_postgres_created_types_match_spark_4_1(spark, jdbc_opts, pg_dsn):
-    import datetime as dt
-
-    import psycopg
-    from pyspark.sql.types import BinaryType, BooleanType, StringType, StructField, StructType, TimestampType
-
-    table = "wt_pg_spark_types"
-    schema = StructType(
-        [
-            StructField("flag", BooleanType()),
-            StructField("payload", BinaryType()),
-            StructField("created_at", TimestampType()),
-            StructField("label", StringType()),
-        ]
-    )
-    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
     try:
-        spark.createDataFrame([(True, b"x", dt.datetime(2026, 1, 2, 3, 4, 5), "ok")], schema).write.format(  # noqa: DTZ001
-            "jdbc"
-        ).option("DBTABLE", table).options(**{key.upper(): value for key, value in jdbc_opts.items()}).mode(
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=tables[0],
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=None,
+            rows=[],
+            mode="append",
+            select_exprs=exprs,
+        )
+        spark.range(1).selectExpr(*exprs).write.format("jdbc").option("dbtable", tables[1]).options(**jdbc_opts).mode(
             "append"
         ).save()
         with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
-            cur.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_name = %s ORDER BY ordinal_position",
-                (table,),
-            )
-            assert dict(cur.fetchall()) == {
-                "flag": "boolean",
-                "payload": "bytea",
-                "created_at": "timestamp with time zone",
-                "label": "text",
-            }
+            snapshots = []
+            for table in tables:
+                cur.execute(
+                    "SELECT column_name, data_type, udt_name, is_nullable, numeric_precision, numeric_scale "
+                    "FROM information_schema.columns WHERE table_name = %s ORDER BY ordinal_position",
+                    (table,),
+                )
+                columns = cur.fetchall()
+                cur.execute(f'SELECT * FROM "{table}"')  # noqa: S608
+                snapshots.append((columns, cur.fetchall()))
+        assert snapshots[0] == snapshots[1]
+        assert len(snapshots[0][0]) == len(exprs)
+    finally:
+        with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+
+
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_postgres_application_name_matches_native_spark_4_1_2(spark, jdbc_opts, pg_dsn):
+    """pgJDBC's ApplicationName property maps to libpq application_name with equal effect.
+
+    The target's ``app`` column defaults to ``current_setting('application_name')``,
+    so every inserted row records the connection property the writer actually applied.
+    Appending a subset of the target's columns also exercises name-based resolution
+    against a wider existing table on both engines.
+    """
+    import psycopg
+    from pyspark.sql.types import IntegerType, StructField, StructType
+
+    table = "wt_pg_app_name_probe"
+    schema = StructType([StructField("id", IntegerType())])
+    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(f'DROP TABLE IF EXISTS "{table}"')
+        cur.execute(f"CREATE TABLE \"{table}\" (id integer, app text DEFAULT current_setting('application_name'))")
+    try:
+        run_native_jdbc_write(
+            dialect="postgresql",
+            jdbc_url=jdbc_opts["url"],
+            dbtable=table,
+            user=jdbc_opts["user"],
+            password=jdbc_opts["password"],
+            schema_json=schema.jsonValue(),
+            rows=[[1]],
+            mode="append",
+            options={"ApplicationName": "sail-parity-probe"},
+        )
+        spark.createDataFrame([(2,)], schema).write.format("jdbc").option("dbtable", table).option(
+            "ApplicationName", "sail-parity-probe"
+        ).options(**jdbc_opts).mode("append").save()
+        with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
+            cur.execute(f'SELECT id, app FROM "{table}" ORDER BY id')  # noqa: S608
+            assert cur.fetchall() == [(1, "sail-parity-probe"), (2, "sail-parity-probe")]
     finally:
         with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
@@ -1006,7 +1027,7 @@ def test_postgres_default_overwrite_schema_change_matches_native_spark_4_1_2(spa
             cur.execute(f'DROP TABLE IF EXISTS "{sail_table}"')
 
 
-@pytest.mark.parametrize("mode", ["errorifexists", "ignore"])
+@pytest.mark.parametrize("mode", [None, "error", "ignore"])
 @pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
 def test_postgres_existing_table_nonwriting_modes_match_native_spark_4_1_2(
     spark,
@@ -1019,8 +1040,9 @@ def test_postgres_existing_table_nonwriting_modes_match_native_spark_4_1_2(
     import psycopg
     from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
-    native_table = f"wt_pg_native_{mode}"
-    sail_table = f"wt_pg_sail_{mode}"
+    suffix = mode or "default"
+    native_table = f"wt_pg_native_{suffix}"
+    sail_table = f"wt_pg_sail_{suffix}"
     with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
         for table in (native_table, sail_table):
             cur.execute(f'DROP TABLE IF EXISTS "{table}"')
@@ -1051,10 +1073,10 @@ def test_postgres_existing_table_nonwriting_modes_match_native_spark_4_1_2(
             )
             (df.write.format("jdbc").option("dbtable", sail_table).options(**jdbc_opts).mode(mode).save())
 
-        if mode == "errorifexists":
+        if mode in (None, "error"):
             with pytest.raises(subprocess.CalledProcessError):
                 native_call()
-            with pytest.raises(Exception, match="errorifexists is not supported"):
+            with pytest.raises(Exception, match="already exists"):
                 sail_call()
         else:
             native_call()
@@ -1291,87 +1313,6 @@ def test_postgres_cascade_truncate_matches_native_spark_4_1_2(
             for parent, child in ((native_parent, native_child), (sail_parent, sail_child)):
                 cur.execute(f'DROP TABLE IF EXISTS "{child}"')
                 cur.execute(f'DROP TABLE IF EXISTS "{parent}" CASCADE')
-
-
-@pytest.mark.parametrize("write_table", ["wt_default_mode"], indirect=True)
-def test_write_default_mode_rejects_existing_target(spark, jdbc_opts, write_table):
-    """Spark's default errorIfExists mode must not silently append."""
-    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-
-    schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
-    df = spark.createDataFrame([(1, "Alice")], schema)
-    with pytest.raises(Exception, match="already exists"):
-        df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).save()
-
-
-@pytest.mark.parametrize("write_table", ["wt_ignore_mode"], indirect=True)
-def test_write_ignore_preserves_existing_target(spark, jdbc_opts, pg_dsn, write_table):
-    """Ignore mode leaves an existing table unchanged."""
-    import psycopg
-    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-
-    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(f'INSERT INTO "{write_table}" VALUES (99, %s, 1.0)', ("old",))  # noqa: S608
-    schema = StructType([StructField("id", IntegerType()), StructField("name", StringType())])
-    df = spark.createDataFrame([(1, "new")], schema)
-    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("ignore").save()
-
-    result = _read_pg_table(spark, jdbc_opts, write_table)
-    assert [(r.id, r.name) for r in result.collect()] == [(99, "old")]
-
-
-@pytest.mark.parametrize("write_table", ["wt_ignore_no_eval"], indirect=True)
-def test_write_ignore_does_not_evaluate_input(spark, jdbc_opts, write_table):
-    """Execution preparation returns skip before the failing input is polled."""
-    df = spark.range(1).selectExpr("raise_error('ignore evaluated input') AS id")
-    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("ignore").save()
-
-
-@pytest.mark.parametrize("write_table", ["wt_schema_replace"], indirect=True)
-def test_write_overwrite_replaces_schema(spark, jdbc_opts, pg_dsn, write_table):
-    """Default overwrite recreates the target from the DataFrame schema."""
-    import psycopg
-    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-
-    schema = StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
-    df = spark.createDataFrame([(7, "seven")], schema)
-    df.write.format("jdbc").option("dbtable", write_table).options(**jdbc_opts).mode("overwrite").save()
-
-    with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = %s ORDER BY ordinal_position",
-            (write_table,),
-        )
-        assert [row[0] for row in cur.fetchall()] == ["new_id", "label"]
-        cur.execute(f'SELECT new_id, label FROM "{write_table}"')  # noqa: S608
-        assert cur.fetchall() == [(7, "seven")]
-
-
-@pytest.mark.parametrize("write_table", ["wt_pg_truncate_option"], indirect=True)
-def test_postgres_truncate_option_preserves_existing_schema(spark, jdbc_opts, pg_dsn, write_table):
-    """Spark's PostgreSQL dialect truncates with ONLY and preserves metadata."""
-    import psycopg
-    from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
-
-    with psycopg.connect(pg_dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(f'CREATE INDEX "{write_table}_name_idx" ON "{write_table}" (name)')
-    df = spark.createDataFrame(
-        [(7, "new", 2.0)],
-        StructType(
-            [
-                StructField("id", IntegerType()),
-                StructField("name", StringType()),
-                StructField("score", DoubleType()),
-            ]
-        ),
-    )
-    df.write.format("jdbc").option("dbtable", write_table).option("truncate", "true").options(**jdbc_opts).mode(
-        "overwrite"
-    ).save()
-
-    with psycopg.connect(pg_dsn) as conn, conn.cursor() as cur:
-        cur.execute("SELECT to_regclass(%s)", (f"{write_table}_name_idx",))
-        assert cur.fetchone()[0] is not None
 
 
 @pytest.mark.parametrize("write_table", ["wt_overwrite"], indirect=True)

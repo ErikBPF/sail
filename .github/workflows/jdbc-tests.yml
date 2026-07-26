@@ -10,6 +10,9 @@ jobs:
     env:
       HATCH_ENV: "test.spark-4.1.1"
       SAIL_SPARK_4_1_2_PYTHON: ${{ github.workspace }}/.venvs/spark-4.1.2-oracle/bin/python
+      # Fails the sentinel test (instead of silently skipping every differential)
+      # if SAIL_SPARK_4_1_2_PYTHON ever stops resolving to a real oracle.
+      SAIL_JDBC_REQUIRE_ORACLE: "1"
     steps:
       - uses: actions/checkout@v7
 

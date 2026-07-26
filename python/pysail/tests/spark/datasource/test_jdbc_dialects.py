@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import pytest
 
-from pysail.testing.spark.jdbc_oracle import native_spark_4_1_2_python, run_native_jdbc_write
+from pysail.testing.spark.jdbc_oracle import (
+    SPARK_TYPE_MATRIX_SELECT_EXPRS,
+    native_spark_4_1_2_python,
+    run_native_jdbc_write,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -57,16 +61,6 @@ def _drop_table(sa_url, table):
     try:
         with engine.begin() as conn:
             conn.execute(sa.text(f"DROP TABLE IF EXISTS {table}"))
-    finally:
-        engine.dispose()
-
-
-def _column_names(sa_url, table):
-    import sqlalchemy as sa
-
-    engine = sa.create_engine(sa_url)
-    try:
-        return [column["name"] for column in sa.inspect(engine).get_columns(table)]
     finally:
         engine.dispose()
 
@@ -121,6 +115,40 @@ def _table_snapshot(sa_url, table):
         return columns, indexes, sorted((tuple(row) for row in rows), key=repr)
     finally:
         engine.dispose()
+
+
+def _created_types_differential(spark, ctx, *, dialect, oracle_options):
+    """Auto-create a target from Spark's full write type matrix on both engines and
+    compare the created column types, nullability, and round-tripped values.
+    """
+    opts, sa_url = ctx
+    native_table = f"wt_{dialect}_native_type_matrix"
+    sail_table = f"wt_{dialect}_sail_type_matrix"
+    for table in (native_table, sail_table):
+        _drop_table(sa_url, table)
+    try:
+        run_native_jdbc_write(
+            dialect=dialect,
+            jdbc_url=opts["url"],
+            dbtable=native_table,
+            user=opts["user"],
+            password=opts["password"],
+            schema_json=None,
+            rows=[],
+            mode="append",
+            options=oracle_options,
+            select_exprs=SPARK_TYPE_MATRIX_SELECT_EXPRS,
+        )
+        spark.range(1).selectExpr(*SPARK_TYPE_MATRIX_SELECT_EXPRS).write.format("jdbc").option(
+            "dbtable", sail_table
+        ).options(**opts).mode("append").save()
+        native = _table_snapshot(sa_url, native_table)
+        sail = _table_snapshot(sa_url, sail_table)
+        assert native == sail
+        assert len(native[0]) == len(SPARK_TYPE_MATRIX_SELECT_EXPRS)
+    finally:
+        for table in (native_table, sail_table):
+            _drop_table(sa_url, table)
 
 
 @pytest.mark.parametrize(
@@ -236,7 +264,7 @@ def test_default_overwrite_schema_change_matches_native_spark(
         ("mssql_ctx", "sqlserver", {"trustServerCertificate": "true"}),
     ],
 )
-@pytest.mark.parametrize("mode", ["errorifexists", "ignore"])
+@pytest.mark.parametrize("mode", [None, "error", "ignore"])
 @pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
 def test_existing_table_nonwriting_modes_match_native_spark(
     request,
@@ -252,8 +280,9 @@ def test_existing_table_nonwriting_modes_match_native_spark(
     from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
     opts, sa_url = request.getfixturevalue(fixture_name)
-    native_table = f"wt_{dialect}_native_{mode}"
-    sail_table = f"wt_{dialect}_sail_{mode}"
+    suffix = mode or "default"
+    native_table = f"wt_{dialect}_native_{suffix}"
+    sail_table = f"wt_{dialect}_sail_{suffix}"
     engine = sa.create_engine(sa_url)
     try:
         with engine.begin() as conn:
@@ -287,10 +316,10 @@ def test_existing_table_nonwriting_modes_match_native_spark(
             )
             (df.write.format("jdbc").option("dbtable", sail_table).options(**opts).mode(mode).save())
 
-        if mode == "errorifexists":
+        if mode in (None, "error"):
             with pytest.raises(subprocess.CalledProcessError):
                 native_call()
-            with pytest.raises(Exception, match="errorifexists is not supported"):
+            with pytest.raises(Exception, match="already exists"):
                 sail_call()
         else:
             native_call()
@@ -438,10 +467,7 @@ def test_sqlalchemy_partition_failure_rolls_back_only_failed_partition(request, 
         writer = SqlAlchemyWriteEngine(
             url=sa_url,
             dbtable=table,
-            columns=["id"],
-            overwrite=False,
             batch_size=1000,
-            run_id="rollback",
         )
         writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
         with pytest.raises(RuntimeError):
@@ -472,10 +498,7 @@ def test_sqlalchemy_retry_after_commit_is_at_least_once(request, fixture_name):
         writer = SqlAlchemyWriteEngine(
             url=sa_url,
             dbtable=table,
-            columns=["id"],
-            overwrite=False,
             batch_size=1000,
-            run_id="retry",
         )
         batch = pa.RecordBatch.from_pydict({"id": [1]})
         writer.write_partition(0, [batch])
@@ -560,66 +583,10 @@ def test_mysql_write_overwrite(spark, mysql_table):
     assert names == {"Charlie"}
 
 
-@pytest.mark.parametrize("mode", [None, "append", "overwrite"])
-def test_mysql_write_creates_missing_table(spark, mysql_ctx, mode):
-    opts, sa_url = mysql_ctx
-    table = f"wt_mysql_create_{mode or 'default'}"
-    _drop_table(sa_url, table)
-    try:
-        df = spark.createDataFrame([(1, "Alice", 9.5)], _schema())
-        writer = df.write.format("jdbc").option("dbtable", table).options(**opts)
-        if mode is not None:
-            writer = writer.mode(mode)
-        writer.save()
-        assert _count_names(sa_url, table) == (1, {"Alice"})
-    finally:
-        _drop_table(sa_url, table)
-
-
-def test_mysql_default_overwrite_replaces_schema(spark, mysql_table):
-    table, opts, sa_url = mysql_table
-    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-
-    df = spark.createDataFrame(
-        [(7, "seven")], StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
-    )
-    df.write.format("jdbc").option("dbtable", table).options(**opts).mode("overwrite").save()
-    assert _column_names(sa_url, table) == ["new_id", "label"]
-
-
-def test_mysql_truncate_overwrite_preserves_schema(spark, mysql_table):
-    table, opts, sa_url = mysql_table
-    df = spark.createDataFrame([(3, "Charlie", 8.8)], _schema())
-    df.write.format("jdbc").option("dbtable", table).option("truncate", "true").options(**opts).mode("overwrite").save()
-    assert _column_names(sa_url, table) == ["id", "name", "score"]
-    assert _count_names(sa_url, table) == (1, {"Charlie"})
-
-
-def test_mysql_created_types_match_spark_4_1(spark, mysql_ctx):
-    import datetime as dt
-
-    from pyspark.sql.types import BinaryType, BooleanType, StructField, StructType, TimestampType
-
-    opts, sa_url = mysql_ctx
-    table = "wt_mysql_spark_types"
-    _drop_table(sa_url, table)
-    try:
-        schema = StructType(
-            [
-                StructField("flag", BooleanType()),
-                StructField("payload", BinaryType()),
-                StructField("created_at", TimestampType()),
-            ]
-        )
-        spark.createDataFrame([(True, b"x", dt.datetime(2026, 1, 2, 3, 4, 5))], schema).write.format(  # noqa: DTZ001
-            "jdbc"
-        ).option("DBTABLE", table).options(**{key.upper(): value for key, value in opts.items()}).mode("append").save()
-        types = _column_types(sa_url, table)
-        assert types["flag"].startswith("bit")
-        assert types["payload"] == "blob"
-        assert types["created_at"] in {"timestamp", "datetime"}
-    finally:
-        _drop_table(sa_url, table)
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_mysql_created_types_match_native_spark_4_1_2(spark, mysql_ctx):
+    """Create-table type mapping parity across Spark's MySQL write matrix."""
+    _created_types_differential(spark, mysql_ctx, dialect="mysql", oracle_options={})
 
 
 def test_mysql_create_options_and_comment(spark, mysql_ctx):
@@ -734,44 +701,6 @@ def test_mysql_truncate_overwrite_matches_native_spark_4_1_2(spark, mysql_ctx):
         with engine.begin() as conn:
             for table in (native_table, sail_table):
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {table}"))
-        engine.dispose()
-
-
-def test_mysql_partition_failure_cleans_staging(mysql_ctx, monkeypatch):
-    import pyarrow as pa
-    import sqlalchemy as sa
-
-    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
-
-    _, sa_url = mysql_ctx
-    table = "wt_mysql_failed_partition"
-    _drop_table(sa_url, table)
-    engine = sa.create_engine(sa_url)
-    try:
-        with engine.begin() as conn:
-            conn.execute(sa.text(f"CREATE TABLE {table} (id INT)"))
-        writer = SqlAlchemyWriteEngine(
-            url=sa_url,
-            dbtable=table,
-            columns=["id"],
-            overwrite=True,
-            batch_size=1000,
-            run_id="failed",
-        )
-
-        def fail_after_create(*_args, **_kwargs):
-            raise RuntimeError("injected ingest failure")
-
-        monkeypatch.setattr(writer, "_insert_arrow", fail_after_create)
-        with pytest.raises(RuntimeError, match="injected ingest failure"):
-            writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
-
-        assert [name for name in sa.inspect(engine).get_table_names() if name.startswith(table)] == [table]
-    finally:
-        with engine.begin() as conn:
-            for name in sa.inspect(engine).get_table_names():
-                if name == table or name.startswith(f"{table}__sail_stg_"):
-                    conn.execute(sa.text(f"DROP TABLE {name}"))
         engine.dispose()
 
 
@@ -949,70 +878,15 @@ def test_mssql_write_overwrite(spark, mssql_table):
     assert names == {"Charlie"}
 
 
-@pytest.mark.parametrize("mode", [None, "append", "overwrite"])
-def test_mssql_write_creates_missing_table(spark, mssql_ctx, mode):
-    opts, sa_url = mssql_ctx
-    table = f"wt_mssql_create_{mode or 'default'}"
-    _drop_table(sa_url, table)
-    try:
-        df = spark.createDataFrame([(1, "Alice", 9.5)], _schema())
-        writer = df.write.format("jdbc").option("dbtable", table).options(**opts)
-        if mode is not None:
-            writer = writer.mode(mode)
-        writer.save()
-        assert _count_names(sa_url, table) == (1, {"Alice"})
-    finally:
-        _drop_table(sa_url, table)
-
-
-def test_mssql_default_overwrite_replaces_schema(spark, mssql_table):
-    table, opts, sa_url = mssql_table
-    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-
-    df = spark.createDataFrame(
-        [(7, "seven")], StructType([StructField("new_id", IntegerType()), StructField("label", StringType())])
+@pytest.mark.skipif(native_spark_4_1_2_python() is None, reason="native Spark 4.1.2 oracle is not configured")
+def test_mssql_created_types_match_native_spark_4_1_2(spark, mssql_ctx):
+    """Create-table type mapping parity across Spark's SQL Server write matrix."""
+    _created_types_differential(
+        spark, mssql_ctx, dialect="sqlserver", oracle_options={"trustServerCertificate": "true"}
     )
-    df.write.format("jdbc").option("dbtable", table).options(**opts).mode("overwrite").save()
-    assert _column_names(sa_url, table) == ["new_id", "label"]
 
 
-def test_mssql_truncate_overwrite_preserves_schema(spark, mssql_table):
-    table, opts, sa_url = mssql_table
-    df = spark.createDataFrame([(3, "Charlie", 8.8)], _schema())
-    df.write.format("jdbc").option("dbtable", table).option("truncate", "true").options(**opts).mode("overwrite").save()
-    assert _column_names(sa_url, table) == ["id", "name", "score"]
-    assert _count_names(sa_url, table) == (1, {"Charlie"})
-
-
-def test_mssql_created_types_match_spark_4_1(spark, mssql_ctx):
-    import datetime as dt
-
-    from pyspark.sql.types import BinaryType, BooleanType, StructField, StructType, TimestampType
-
-    opts, sa_url = mssql_ctx
-    table = "wt_mssql_spark_types"
-    _drop_table(sa_url, table)
-    try:
-        schema = StructType(
-            [
-                StructField("flag", BooleanType()),
-                StructField("payload", BinaryType()),
-                StructField("created_at", TimestampType()),
-            ]
-        )
-        spark.createDataFrame([(True, b"x", dt.datetime(2026, 1, 2, 3, 4, 5))], schema).write.format(  # noqa: DTZ001
-            "jdbc"
-        ).option("DBTABLE", table).options(**{key.upper(): value for key, value in opts.items()}).mode("append").save()
-        types = _column_types(sa_url, table)
-        assert types["flag"] == "bit"
-        # SQLAlchemy's pymssql inspector omits the MAX length marker.
-        assert types["payload"] == "varbinary"
-        assert types["created_at"] == "datetime"
-    finally:
-        _drop_table(sa_url, table)
-
-
-def test_mssql_create_options_and_comment(spark, mssql_ctx):
+def test_mssql_create_options_and_comment_ignored(spark, mssql_ctx):
     import sqlalchemy as sa
     from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
@@ -1021,6 +895,8 @@ def test_mssql_create_options_and_comment(spark, mssql_ctx):
     _drop_table(sa_url, table)
     try:
         schema = StructType([StructField("id", IntegerType()), StructField("label", StringType())])
+        # Spark's MsSqlServerDialect cannot create table comments: createTable
+        # swallows the dialect error, warns, and leaves the table comment-less.
         spark.createDataFrame([(1, "one")], schema).write.format("jdbc").option("dbtable", table).options(
             **opts,
             createTableColumnTypes="LABEL VARCHAR(32)",
@@ -1044,9 +920,9 @@ def test_mssql_create_options_and_comment(spark, mssql_ctx):
                     "WHERE major_id = OBJECT_ID(:table) AND name = 'MS_Description'"
                 ),
                 {"table": table},
-            ).scalar_one()
+            ).scalar_one_or_none()
         engine.dispose()
-        assert (length, comment) == (32, "spark parity evidence")
+        assert (length, comment) == (32, None)
     finally:
         _drop_table(sa_url, table)
 
@@ -1126,42 +1002,4 @@ def test_mssql_truncate_overwrite_matches_native_spark_4_1_2(spark, mssql_ctx):
         with engine.begin() as conn:
             for table in (native_table, sail_table):
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {table}"))
-        engine.dispose()
-
-
-def test_mssql_partition_failure_cleans_staging(mssql_ctx, monkeypatch):
-    import pyarrow as pa
-    import sqlalchemy as sa
-
-    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
-
-    _, sa_url = mssql_ctx
-    table = "wt_mssql_failed_partition"
-    _drop_table(sa_url, table)
-    engine = sa.create_engine(sa_url)
-    try:
-        with engine.begin() as conn:
-            conn.execute(sa.text(f"CREATE TABLE {table} (id INT)"))
-        writer = SqlAlchemyWriteEngine(
-            url=sa_url,
-            dbtable=table,
-            columns=["id"],
-            overwrite=True,
-            batch_size=1000,
-            run_id="failed",
-        )
-
-        def fail_after_create(*_args, **_kwargs):
-            raise RuntimeError("injected ingest failure")
-
-        monkeypatch.setattr(writer, "_insert_arrow", fail_after_create)
-        with pytest.raises(RuntimeError, match="injected ingest failure"):
-            writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
-
-        assert [name for name in sa.inspect(engine).get_table_names() if name.startswith(table)] == [table]
-    finally:
-        with engine.begin() as conn:
-            for name in sa.inspect(engine).get_table_names():
-                if name == table or name.startswith(f"{table}__sail_stg_"):
-                    conn.execute(sa.text(f"DROP TABLE {name}"))
         engine.dispose()

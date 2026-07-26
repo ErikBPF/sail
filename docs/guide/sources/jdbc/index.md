@@ -227,7 +227,7 @@ They are safe to drop manually.
 | Write option              | Default | Description                                        |
 | ------------------------- | ------- | -------------------------------------------------- |
 | `dbtable`                 |         | Target table, optionally `<schema>.<table>`; surrounding whitespace is ignored |
-| `truncate`                | `false` | Preserve table on MySQL/SQL Server overwrite       |
+| `truncate`                | `false` | Truncate instead of drop/recreate on overwrite (Spark dialect SQL; PostgreSQL uses `TRUNCATE TABLE ONLY`) |
 | `cascadeTruncate`         | `false` | Cascade PostgreSQL truncate to FK dependencies     |
 | `sail.jdbc.overwriteMode` | —       | `atomic` or `truncate` (PostgreSQL overwrite only) |
 | `batchsize`               | `1000`  | Rows per ingest call                               |
@@ -239,9 +239,10 @@ They are safe to drop manually.
 | `tableComment`            | —       | Best-effort table comment, matching Spark behavior |
 | `driver`                  | —       | Native driver class is accepted; custom JVM drivers are rejected |
 
-In explicit `append` or `overwrite` mode, a missing target is created from the
-DataFrame schema. PySpark's Python data-source API currently rejects the default
-`errorIfExists` mode before the JDBC writer runs, so specify a mode explicitly.
+A missing target is created from the DataFrame schema in every save mode. The
+default `errorIfExists` mode fails against an existing target, `ignore` skips
+the write without evaluating the input, and `append`/`overwrite` follow Spark's
+built-in JDBC writer semantics.
 
 `createTableOptions` is trusted raw database DDL, as it is in Spark. Do not build
 it from untrusted input. It is used only while creating a missing table or

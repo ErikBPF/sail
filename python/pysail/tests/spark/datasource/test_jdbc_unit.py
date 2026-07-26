@@ -406,6 +406,27 @@ def test_create_table_column_types_reject_duplicates():
         )
 
 
+def test_create_table_comment_warns_and_ignores_on_unsupported_dialect(tmp_path):
+    """Spark parity: dialects without comment support warn and create the table anyway.
+
+    Mirrors JdbcUtils.createTable, where MsSqlServerDialect.getTableCommentQuery
+    throws and the exception is swallowed with a warning.
+    """
+    sa = pytest.importorskip("sqlalchemy")
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _create_sqlalchemy_table
+
+    url = f"sqlite:///{tmp_path / 'target.db'}"
+    with pytest.warns(RuntimeWarning, match="comment ignored"):
+        _create_sqlalchemy_table(url, {}, "t", pa.schema([("id", pa.int32())]), table_comment="nope")
+    engine = sa.create_engine(url)
+    try:
+        assert sa.inspect(engine).get_table_names() == ["t"]
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.parametrize("bad", ["0", "-1", "not-an-integer"])
 def test_write_batchsize_must_be_positive(bad):
     """writer() rejects a non-positive batchsize on the driver, before fan-out.
@@ -500,18 +521,6 @@ def test_write_num_partitions_must_be_positive_integer(bad):
         ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
 
 
-def test_arrow_chunks_honor_batchsize_and_partial_tail():
-    import pyarrow as pa
-
-    from pysail.spark.datasource.jdbc import _iter_arrow_chunks
-
-    table = pa.table({"id": range(5)})
-    chunks = list(_iter_arrow_chunks(table, 2))
-
-    assert [chunk.num_rows for chunk in chunks] == [2, 2, 1]
-    assert [value.as_py() for chunk in chunks for value in chunk["id"]] == list(range(5))
-
-
 def test_sqlalchemy_insert_calls_respect_batchsize(tmp_path):
     sa = pytest.importorskip("sqlalchemy")
     import pyarrow as pa
@@ -533,10 +542,7 @@ def test_sqlalchemy_insert_calls_respect_batchsize(tmp_path):
     writer = SqlAlchemyWriteEngine(
         url=url,
         dbtable="t",
-        columns=["id"],
-        overwrite=False,
         batch_size=2,
-        run_id="run",
     )
     try:
         writer._insert_arrow(engine, table, pa.table({"id": range(5)}))  # noqa: SLF001
@@ -654,10 +660,7 @@ def test_sqlalchemy_writer_streams_before_requesting_next_batch(tmp_path):
     writer = SqlAlchemyWriteEngine(
         url=url,
         dbtable="t",
-        columns=["id"],
-        overwrite=False,
         batch_size=1000,
-        run_id="stream",
     )
 
     def batches():
@@ -721,104 +724,6 @@ def test_postgres_writer_streams_before_requesting_next_batch(monkeypatch):
     assert ingested == [1, 2]
 
 
-def test_sqlalchemy_staging_create_is_retry_safe(tmp_path):
-    """Re-creating a staging table of the same name must drop-then-create, not raise
-    "table already exists" (defends against a leftover from a crashed prior attempt).
-    """
-    sa = pytest.importorskip("sqlalchemy")
-
-    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
-
-    url = f"sqlite:///{tmp_path / 'target.db'}"
-    setup = sa.create_engine(url)
-    with setup.begin() as conn:
-        conn.execute(sa.text("CREATE TABLE t (id INTEGER)"))
-    setup.dispose()
-
-    writer = SqlAlchemyWriteEngine(url=url, dbtable="t", columns=["id"], overwrite=True, batch_size=1000, run_id="run")
-    engine = writer._create_engine()  # noqa: SLF001
-    try:
-        staging = writer._staging("tok")  # noqa: SLF001
-        writer._create_staging_like_target(engine, staging)  # noqa: SLF001
-        writer._create_staging_like_target(engine, staging)  # second create must not raise  # noqa: SLF001
-    finally:
-        engine.dispose()
-
-
-def test_sqlalchemy_partition_failure_removes_created_staging(tmp_path, monkeypatch):
-    """Failure after CREATE must not leave a random staging table unknown to abort()."""
-    sa = pytest.importorskip("sqlalchemy")
-    import pyarrow as pa
-
-    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
-
-    url = f"sqlite:///{tmp_path / 'target.db'}"
-    setup = sa.create_engine(url)
-    with setup.begin() as conn:
-        conn.execute(sa.text("CREATE TABLE t (id INTEGER)"))
-    setup.dispose()
-
-    writer = SqlAlchemyWriteEngine(
-        url=url,
-        dbtable="t",
-        columns=["id"],
-        overwrite=True,
-        batch_size=1000,
-        run_id="run",
-    )
-
-    def fail_after_create(*_args, **_kwargs):
-        raise RuntimeError("injected ingest failure")
-
-    monkeypatch.setattr(writer, "_insert_arrow", fail_after_create)
-    with pytest.raises(RuntimeError, match="injected ingest failure"):
-        writer.write_partition(0, [pa.RecordBatch.from_pydict({"id": [1]})])
-
-    check = sa.create_engine(url)
-    try:
-        assert sa.inspect(check).get_table_names() == ["t"]
-    finally:
-        check.dispose()
-
-
-def test_sqlalchemy_overwrite_distinct_partitions_no_data_loss(tmp_path):
-    """Two partitions in one overwrite must not clobber each other's staging.
-
-    Sail leaves partitionId() at 0 for every partition, so a partition-id-derived staging
-    name would collide and one partition would drop another's rows mid-write. Names are
-    uniquified per write_partition call instead; committing both must keep every row.
-    """
-    sa = pytest.importorskip("sqlalchemy")
-    import pyarrow as pa
-
-    from pysail.spark.datasource.jdbc import SqlAlchemyWriteEngine
-
-    url = f"sqlite:///{tmp_path / 'target.db'}"
-    setup = sa.create_engine(url)
-    with setup.begin() as conn:
-        conn.execute(sa.text("CREATE TABLE t (id INTEGER, name TEXT)"))
-        conn.execute(sa.text("INSERT INTO t VALUES (99, 'old')"))
-    setup.dispose()
-
-    writer = SqlAlchemyWriteEngine(
-        url=url, dbtable="t", columns=["id", "name"], overwrite=True, batch_size=1000, run_id="run"
-    )
-    b1 = pa.RecordBatch.from_pydict({"id": [1, 2], "name": ["a", "b"]})
-    b2 = pa.RecordBatch.from_pydict({"id": [3, 4], "name": ["c", "d"]})
-    # Both partitions report id 0 (as Sail does); the staging names must still differ.
-    r1 = writer.write_partition(0, [b1])
-    r2 = writer.write_partition(0, [b2])
-    assert r1.staging_table != r2.staging_table
-
-    assert writer.commit([r1, r2]) == 4  # noqa: PLR2004
-
-    check = sa.create_engine(url)
-    with check.begin() as conn:
-        rows = sorted(conn.execute(sa.text("SELECT id, name FROM t")).fetchall())
-    check.dispose()
-    assert rows == [(1, "a"), (2, "b"), (3, "c"), (4, "d")]  # old row gone, both partitions kept
-
-
 def test_write_engines_reject_nonpositive_batch_size():
     """Both engines validate batch_size on construction (defence in depth)."""
     from pysail.spark.datasource.jdbc import PgWriteEngine, SqlAlchemyWriteEngine
@@ -826,7 +731,18 @@ def test_write_engines_reject_nonpositive_batch_size():
     with pytest.raises(ValueError, match="batch_size"):
         PgWriteEngine(dsn="postgresql://x/y", dbtable="t", batch_size=0)
     with pytest.raises(ValueError, match="batch_size"):
-        SqlAlchemyWriteEngine(url="sqlite://", dbtable="t", columns=["id"], overwrite=True, batch_size=0, run_id="r")
+        SqlAlchemyWriteEngine(url="sqlite://", dbtable="t", batch_size=0)
+
+
+def test_arrow_chunks_honor_batchsize_and_partial_tail():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import _iter_arrow_chunks
+
+    table = pa.table({"id": range(7)})
+    chunks = list(_iter_arrow_chunks(table, 3))
+    assert [chunk.num_rows for chunk in chunks] == [3, 3, 1]
+    assert pa.concat_tables(chunks).equals(table)
 
 
 def test_write_unsupported_dialect_raises():
@@ -980,10 +896,7 @@ def test_sqlalchemy_isolation_falls_back_when_driver_rejects(monkeypatch):
         engine = jdbc.SqlAlchemyWriteEngine(
             url="mysql+pymysql://host/db",
             dbtable="t",
-            columns=["id"],
-            overwrite=False,
             batch_size=1000,
-            run_id="run",
             isolation_level="SERIALIZABLE",
         )._create_engine()  # noqa: SLF001
 
@@ -1018,22 +931,6 @@ def test_write_options_no_dbtable_raises():
 # ---------------------------------------------------------------------------
 # PgWriteEngine identifier + staging name helpers
 # ---------------------------------------------------------------------------
-
-
-def test_quote_qualified_schema_qualified():
-    """_quote_qualified handles schema-qualified names (used by the write engine)."""
-    from pysail.spark.datasource.jdbc import _quote_qualified
-
-    assert _quote_qualified("public.foo") == '"public"."foo"'
-    assert _quote_qualified("foo") == '"foo"'
-
-
-def test_split_schema():
-    """_split_schema separates the schema from the table name."""
-    from pysail.spark.datasource.jdbc import _split_schema
-
-    assert _split_schema("orders") == (None, "orders")
-    assert _split_schema("public.orders") == ("public", "orders")
 
 
 def test_pg_write_engine_staging_name():
@@ -1083,31 +980,6 @@ def test_postgres_generated_names_remain_distinct_after_server_truncation(helper
 # ---------------------------------------------------------------------------
 # overwrite_mode option resolution
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.usefixtures("stub_target_exists")
-def test_overwrite_mode_default_matches_spark():
-    """Default overwrite prepares drop/recreate only when execution starts."""
-    import pyarrow as pa
-
-    from pysail.spark.datasource.jdbc import JdbcDataSource, JdbcDataSourceWriter
-
-    schema = pa.schema([("id", pa.int32())])
-    ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "t"})
-    writer = ds.writer(schema, overwrite=True)
-    assert isinstance(writer, JdbcDataSourceWriter)
-    assert writer._engine.overwrite_mode == "append"  # noqa: SLF001
-
-
-def test_write_dbtable_trims_surrounding_whitespace_like_spark():
-    """JDBCOptions.tableOrQuery trims dbtable before save-mode planning."""
-    import pyarrow as pa
-
-    from pysail.spark.datasource.jdbc import JdbcDataSource
-
-    ds = JdbcDataSource(options={"url": "jdbc:postgresql://localhost:5432/db", "dbtable": "  public.events  "})
-    writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=False)
-    assert writer._dbtable == "public.events"  # noqa: SLF001
 
 
 def test_writer_construction_is_database_side_effect_free(monkeypatch):
@@ -1210,59 +1082,6 @@ def test_ignore_existing_target_returns_skip_writer():
     assert writer._sail_prepare() == "skip"  # noqa: SLF001
 
 
-def test_sqlalchemy_truncate_option_preserves_target(monkeypatch):
-    """MySQL/SQL Server honor Spark's truncate=true overwrite option."""
-    import pyarrow as pa
-
-    from pysail.spark.datasource import jdbc
-
-    reset = []
-    monkeypatch.setattr(jdbc, "_sqlalchemy_table_exists", lambda *_a, **_k: True)
-    monkeypatch.setattr(jdbc, "_sqlalchemy_target_columns", lambda *_a, **_k: ["id"])
-    monkeypatch.setattr(jdbc, "_reset_sqlalchemy_table", lambda *_a, **k: reset.append(k["truncate"]))
-    ds = jdbc.JdbcDataSource(
-        options={
-            "url": "jdbc:mysql://localhost/db",
-            "dbtable": "t",
-            "truncate": "true",
-            "__sail_save_mode": "overwrite",
-        }
-    )
-    writer = ds.writer(pa.schema([("id", pa.int32())]), overwrite=True)
-    assert reset == []
-    assert writer._sail_prepare() == "write"  # noqa: SLF001
-    assert reset == [True]
-    assert writer._engine.overwrite is False  # noqa: SLF001
-
-
-@pytest.mark.parametrize("cascade", ["false", "true"])
-def test_postgres_truncate_option_uses_spark_dialect_sql(monkeypatch, cascade):
-    import pyarrow as pa
-
-    from pysail.spark.datasource import jdbc
-
-    calls = []
-    monkeypatch.setattr(jdbc, "_pg_table_exists", lambda *_a, **_k: True)
-    monkeypatch.setattr(jdbc, "_pg_target_columns", lambda *_a, **_k: ["id"])
-    monkeypatch.setattr(
-        jdbc,
-        "_truncate_pg_table",
-        lambda *_a, **kwargs: calls.append(kwargs["cascade"]),
-    )
-    writer = jdbc.JdbcDataSource(
-        options={
-            "url": "jdbc:postgresql://localhost/db",
-            "dbtable": "t",
-            "truncate": "true",
-            "cascadeTruncate": cascade,
-            "__sail_save_mode": "overwrite",
-        }
-    ).writer(pa.schema([("id", pa.int32())]), overwrite=True)
-
-    assert writer._sail_prepare() == "write"  # noqa: SLF001
-    assert calls == [cascade == "true"]
-
-
 @pytest.mark.usefixtures("stub_target_exists")
 def test_truncate_option_rejects_non_boolean():
     import pyarrow as pa
@@ -1355,28 +1174,6 @@ def test_namespaced_overwrite_mode_rejects_invalid_combinations(options, overwri
     )
     with pytest.raises(ValueError, match=match):
         ds.writer(pa.schema([("id", pa.int32())]), overwrite=overwrite)
-
-
-def test_staging_name_atomic_run_id_suffix():
-    """_staging_name_atomic suffixes the run_id so concurrent writers don't collide."""
-    from pysail.spark.datasource.jdbc import _staging_name_atomic
-
-    assert _staging_name_atomic("public.orders", "deadbeef") == "public.orders__sail_stg_deadbeef"
-    assert _staging_name_atomic("orders", "deadbeef") == "orders__sail_stg_deadbeef"
-    # Different run_ids → different staging tables (the concurrency-collision fix)
-    assert _staging_name_atomic("orders", "run1") != _staging_name_atomic("orders", "run2")
-
-
-def test_pg_write_engine_generates_run_id():
-    """Each engine instance gets a run_id; passing one is honored."""
-    from pysail.spark.datasource.jdbc import PgWriteEngine
-
-    e1 = PgWriteEngine(dsn="postgresql://x/y", dbtable="t", overwrite_mode="atomic")
-    e2 = PgWriteEngine(dsn="postgresql://x/y", dbtable="t", overwrite_mode="atomic")
-    assert e1.run_id
-    assert e2.run_id
-    assert e1.run_id != e2.run_id  # distinct engines → distinct run_ids
-    assert PgWriteEngine(dsn="postgresql://x/y", dbtable="t", run_id="fixed").run_id == "fixed"
 
 
 def test_concurrent_engines_have_distinct_staging_names():

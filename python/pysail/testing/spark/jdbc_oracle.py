@@ -19,6 +19,27 @@ _DRIVER_CLASSES = {
     "sqlserver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
 }
 
+# Every Spark type the write path can auto-create on all three backends. Evaluated
+# with selectExpr by both engines so create-table type mappings can be compared.
+SPARK_TYPE_MATRIX_SELECT_EXPRS = [
+    "CAST(true AS BOOLEAN) AS c_bool",
+    "CAST(1 AS TINYINT) AS c_byte",
+    "CAST(2 AS SMALLINT) AS c_short",
+    "CAST(3 AS INT) AS c_int",
+    "CAST(4 AS BIGINT) AS c_long",
+    "CAST(1.5 AS FLOAT) AS c_float",
+    "CAST(2.5 AS DOUBLE) AS c_double",
+    "CAST(3.14 AS DECIMAL(10,2)) AS c_decimal",
+    "'text' AS c_string",
+    "X'0102' AS c_binary",
+    "DATE'2026-01-02' AS c_date",
+    "TIMESTAMP'2026-01-02 03:04:05' AS c_ts",
+    # Typed literal, not CAST(string): Spark marks failable casts force-nullable
+    # while Sail keeps the literal's non-nullability, so a cast here would make
+    # the created columns' nullability legitimately differ between engines.
+    "TIMESTAMP_NTZ'2026-01-02 03:04:05' AS c_ts_ntz",
+]
+
 
 def native_spark_4_1_2_python() -> Path | None:
     """Return the configured isolated Spark 4.1.2 interpreter, if available."""
@@ -33,7 +54,7 @@ def run_native_jdbc_write(
     dbtable: str,
     user: str,
     password: str,
-    schema_json: dict,
+    schema_json: dict | None,
     rows: list[list[object]],
     mode: str | None,
     options: dict[str, str] | None = None,
@@ -67,6 +88,7 @@ from pyspark.sql.types import StructType
 spark = (SparkSession.builder.master("local[2]")
          .appName("sail-jdbc-spark-oracle")
          .config("spark.ui.enabled", "false")
+         .config("spark.sql.session.timeZone", "UTC")
          .config("spark.jars.packages", payload["package"])
          .getOrCreate())
 try:
@@ -90,6 +112,7 @@ finally:
     spark.stop()
 """
     env = os.environ.copy()
+    env["TZ"] = "UTC"
     env["PYSPARK_PYTHON"] = str(python)
     env["PYSPARK_DRIVER_PYTHON"] = str(python)
     subprocess.run(

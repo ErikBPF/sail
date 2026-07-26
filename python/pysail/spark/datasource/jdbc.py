@@ -468,7 +468,7 @@ class PartitionResult:
 
     partition_id: int
     rows_written: int
-    staging_table: str | None  # set only in atomic overwrite mode
+    staging_table: str | None = None  # set only by PostgreSQL atomic overwrite
 
 
 class PgWriteEngine:
@@ -757,8 +757,8 @@ def _parse_sqlserver_url(rest: str) -> tuple[str, dict[str, object]]:
     authority has none; ``encrypt=true|false`` -> ``encryption`` (require/off);
     ``applicationIntent=ReadOnly`` -> ``read_only=True``. Microsoft-JDBC-specific
     certificate properties and unsupported encryption modes are rejected because
-    pymssql/FreeTDS cannot preserve their security semantics. Other unknown params
-    are dropped because pymssql would reject them.
+    pymssql/FreeTDS cannot preserve their security semantics. Any other unknown
+    param is rejected as well rather than silently dropped.
     """
     from urllib.parse import quote  # noqa: PLC0415
 
@@ -1206,23 +1206,19 @@ def _create_pg_table(
     table_comment: str = "",
     query_timeout: int = 0,
 ) -> None:
-    """Create a missing PostgreSQL target once on the driver."""
-    if options or column_types:
-        import psycopg  # noqa: PLC0415
+    """Create a missing PostgreSQL target once on the driver.
 
-        with (
-            psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout), autocommit=True) as conn,
-            conn.cursor() as cur,
-        ):
-            cur.execute(_create_table_sql(dbtable, schema, "postgresql", options, column_types, case_sensitive))
-    else:
-        import adbc_driver_postgresql.dbapi as pg_dbapi  # noqa: PLC0415
+    Always compiled DDL, never ADBC's ``mode="create"`` ingest: ADBC infers
+    types from the Arrow schema and loses Spark's exact DDL — e.g. it creates
+    a bare ``numeric`` for ``DECIMAL(p,s)`` where Spark emits ``NUMERIC(p,s)``.
+    """
+    import psycopg  # noqa: PLC0415
 
-        db_schema, table = _split_schema(dbtable)
-        with pg_dbapi.connect(dsn) as conn:
-            with conn.cursor() as cur:
-                cur.adbc_ingest(table, schema.empty_table(), mode="create", db_schema_name=db_schema)
-            conn.commit()
+    with (
+        psycopg.connect(_postgresql_dsn_with_timeout(dsn, query_timeout), autocommit=True) as conn,
+        conn.cursor() as cur,
+    ):
+        cur.execute(_create_table_sql(dbtable, schema, "postgresql", options, column_types, case_sensitive))
     if table_comment:
         import psycopg  # noqa: PLC0415
         from psycopg import sql  # noqa: PLC0415
@@ -1295,22 +1291,16 @@ def _create_sqlalchemy_table(
         else:
             sa.Table(table, sa.MetaData(), *columns, schema=db_schema).create(engine, checkfirst=True)
         if table_comment:
-            prep = engine.dialect.identifier_preparer
-            qualified = f"{prep.quote(db_schema)}.{prep.quote(table)}" if db_schema else prep.quote(table)
             try:
+                if engine.dialect.name != "mysql":
+                    # Spark's MsSqlServerDialect rejects table comments; the shared
+                    # createTable path swallows that and ignores the comment.
+                    msg = "table comments are not supported for this dialect"
+                    raise NotImplementedError(msg)
+                prep = engine.dialect.identifier_preparer
+                qualified = f"{prep.quote(db_schema)}.{prep.quote(table)}" if db_schema else prep.quote(table)
                 with engine.begin() as conn:
-                    if engine.dialect.name == "mysql":
-                        conn.execute(sa.text(f"ALTER TABLE {qualified} COMMENT = :comment"), {"comment": table_comment})
-                    elif engine.dialect.name == "mssql":
-                        conn.execute(
-                            sa.text(
-                                "EXEC sys.sp_addextendedproperty "
-                                "@name=N'MS_Description', @value=:comment, "
-                                "@level0type=N'SCHEMA', @level0name=:schema, "
-                                "@level1type=N'TABLE', @level1name=:table"
-                            ),
-                            {"comment": table_comment, "schema": db_schema or "dbo", "table": table},
-                        )
+                    conn.execute(sa.text(f"ALTER TABLE {qualified} COMMENT = :comment"), {"comment": table_comment})
             except Exception:  # noqa: BLE001
                 import warnings  # noqa: PLC0415
 
@@ -1347,14 +1337,10 @@ class SqlAlchemyWriteEngine:
     table's Python values (``to_pylist``), which preserves exact ints (bigints > 2**53)
     and keeps NULL distinct from 0 — unlike a pandas ``to_sql`` float64 round-trip.
 
-    * ``append``    ingests into the target. At-least-once: a retried task re-inserts,
-      so duplicates are possible (as with Spark's JDBC writer); use a unique constraint.
-    * ``overwrite`` loads each partition into its own staging table, then the driver
-      swaps them in via one ``DELETE`` + ``INSERT ... SELECT`` transaction.
-
-    Concurrent overwrites to the same table are unsupported: two jobs can interleave
-    their DELETE/INSERT and leave a mixed result. Run overwrites one at a time.
-    Failed cleanup can orphan ``*__sail_stg_*`` tables — safe to drop.
+    Partitions always append into the target; save-mode DDL (create, drop/recreate,
+    truncate) happens once on the driver in ``_sail_prepare``, matching Spark's JDBC
+    writer. At-least-once: a retried task re-inserts, so duplicates are possible
+    (as with Spark's JDBC writer); use a unique constraint.
     """
 
     def __init__(
@@ -1362,10 +1348,7 @@ class SqlAlchemyWriteEngine:
         *,
         url: str,
         dbtable: str,
-        columns: list[str],
-        overwrite: bool,
         batch_size: int,
-        run_id: str,
         connect_args: dict | None = None,
         case_sensitive: bool = False,
         isolation_level: str = "READ_UNCOMMITTED",
@@ -1376,10 +1359,7 @@ class SqlAlchemyWriteEngine:
             raise ValueError(msg)
         self.url = url
         self.dbtable = dbtable
-        self.columns = columns
-        self.overwrite = overwrite
         self.batch_size = batch_size
-        self.run_id = run_id
         self.connect_args = connect_args or {}
         self.case_sensitive = case_sensitive
         self.isolation_level = isolation_level
@@ -1418,13 +1398,6 @@ class SqlAlchemyWriteEngine:
             )
         return engine
 
-    def _staging(self, token: str) -> str:
-        return f"{self.table}{_STAGING_PREFIX}{self.run_id}_{token}"
-
-    @staticmethod
-    def _qualified(prep, schema: str | None, name: str) -> str:
-        return f"{prep.quote(schema)}.{prep.quote(name)}" if schema else prep.quote(name)
-
     def _reflect_table(self, engine, table_name: str):
         """Reflect *table_name* from the live database into an ``sa.Table``."""
         import sqlalchemy as sa  # noqa: PLC0415
@@ -1458,44 +1431,16 @@ class SqlAlchemyWriteEngine:
             with engine.begin() as transaction:
                 insert_batches(transaction)
 
-    def _create_staging_like_target(self, engine, staging: str):
-        """Create an empty staging table matching the target's columns; return its
-        ``sa.Table`` so the caller can insert without a second reflection round-trip.
-        """
-        import sqlalchemy as sa  # noqa: PLC0415
-
-        target = self._reflect_table(engine, self.table)
-        staging_cols = [
-            sa.Column(c.name, c.type, nullable=c.nullable, primary_key=c.primary_key) for c in target.columns
-        ]
-        # Drop-then-create so a leftover from a prior attempt never carries stale rows forward.
-        staging_table = sa.Table(staging, sa.MetaData(), *staging_cols, schema=self.schema)
-        with engine.begin() as conn:
-            conn.execute(sa.schema.DropTable(staging_table, if_exists=True))
-            staging_table.create(conn)
-        return staging_table
-
     def write_partition(self, partition_id: int, batches: Iterable[pa.RecordBatch]) -> PartitionResult:
         import itertools  # noqa: PLC0415
 
-        staging: str | None = None
         rows = 0
         engine = self._create_engine()
         try:
             nonempty = (batch for batch in batches if batch.num_rows > 0)
             first = next(nonempty, None)
             if first is not None:
-                if self.overwrite:
-                    # Unique per call, not by partition_id (always 0 here — see _ArrowWriter):
-                    # a shared name would let one partition drop another's staging mid-write.
-                    # commit()/abort() read the names back from results, so this is sufficient.
-                    import uuid  # noqa: PLC0415
-
-                    staging = self._staging(uuid.uuid4().hex[:12])
-                    staging_table = self._create_staging_like_target(engine, staging)
-                    target_table = staging_table
-                else:
-                    target_table = self._reflect_table(engine, self.table)
+                target_table = self._reflect_table(engine, self.table)
                 with engine.begin() as conn:
                     for batch in itertools.chain((first,), nonempty):
                         self._insert_arrow(
@@ -1506,65 +1451,19 @@ class SqlAlchemyWriteEngine:
                         )
                         rows += batch.num_rows
         except Exception as e:
-            if staging is not None:
-                with contextlib.suppress(Exception):
-                    self._drop_stagings(engine, [staging], engine.dialect.identifier_preparer)
             safe_msg = _safe_error(e, self.url)
             msg = f"SQLAlchemy write failed for partition {partition_id} into {self.dbtable!r}: {safe_msg}"
             raise RuntimeError(msg) from e
         finally:
             engine.dispose()
 
-        return PartitionResult(partition_id=partition_id, rows_written=rows, staging_table=staging)
+        return PartitionResult(partition_id=partition_id, rows_written=rows)
 
     def commit(self, results: list[PartitionResult]) -> int:
-        total = sum(r.rows_written for r in results)
-        if not self.overwrite:
-            return total
-
-        import sqlalchemy as sa  # noqa: PLC0415
-
-        engine = self._create_engine()
-        prep = engine.dialect.identifier_preparer
-        qtarget = self._qualified(prep, self.schema, self.table)
-        cols = ", ".join(prep.quote(c) for c in self.columns)
-        stagings = [r.staging_table for r in results if r.staging_table]
-        try:
-            with engine.begin() as conn:
-                conn.execute(sa.text(f"DELETE FROM {qtarget}"))  # noqa: S608
-                for staging in stagings:
-                    qstaging = self._qualified(prep, self.schema, staging)
-                    conn.execute(sa.text(f"INSERT INTO {qtarget} ({cols}) SELECT {cols} FROM {qstaging}"))  # noqa: S608
-            # Swap already committed; staging cleanup is best-effort, must not fail the job.
-            with contextlib.suppress(Exception):
-                self._drop_stagings(engine, stagings, prep)
-        except Exception as e:
-            safe_msg = _safe_error(e, self.url)
-            msg = f"SQLAlchemy overwrite commit failed for {self.dbtable!r}: {safe_msg}"
-            raise RuntimeError(msg) from e
-        finally:
-            engine.dispose()
-        return total
+        return sum(r.rows_written for r in results)
 
     def abort(self, results: list[PartitionResult]) -> None:
-        if not self.overwrite:
-            return
-        engine = self._create_engine()
-        try:
-            self._drop_stagings(
-                engine, [r.staging_table for r in results if r.staging_table], engine.dialect.identifier_preparer
-            )
-        except Exception:  # noqa: BLE001, S110 — abort must not mask the original error
-            pass
-        finally:
-            engine.dispose()
-
-    def _drop_stagings(self, engine, stagings: list[str], prep) -> None:
-        import sqlalchemy as sa  # noqa: PLC0415
-
-        with engine.begin() as conn:
-            for staging in stagings:
-                conn.execute(sa.text(f"DROP TABLE IF EXISTS {self._qualified(prep, self.schema, staging)}"))
+        """Partitions append directly and roll back their own transaction on failure."""
 
 
 @dataclass
@@ -1712,10 +1611,7 @@ class SqlAlchemyDataSourceWriter(_ArrowWriter):
         save_mode: str,
         truncate: bool,
         case_sensitive: bool,
-        columns: list[str],
-        overwrite: bool,
         batch_size: int,
-        run_id: str,
         create_table_options: str = "",
         create_table_column_types: str = "",
         isolation_level: str = "READ_UNCOMMITTED",
@@ -1739,10 +1635,7 @@ class SqlAlchemyDataSourceWriter(_ArrowWriter):
             SqlAlchemyWriteEngine(
                 url=url,
                 dbtable=dbtable,
-                columns=columns,
-                overwrite=overwrite,
                 batch_size=batch_size,
-                run_id=run_id,
                 connect_args=connect_args,
                 case_sensitive=case_sensitive,
                 isolation_level=isolation_level,
@@ -2230,10 +2123,7 @@ class JdbcDataSource(DataSource):
                 save_mode=save_mode,
                 truncate=overwrite and truncate_requested,
                 case_sensitive=case_sensitive,
-                columns=list(schema.names),
-                overwrite=False,
                 batch_size=batch_size,
-                run_id=run_id,
                 create_table_options=create_table_options,
                 create_table_column_types=create_table_column_types,
                 isolation_level=isolation_level,
