@@ -24,7 +24,7 @@ import contextlib
 import datetime
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import pyarrow as pa
 
@@ -112,6 +112,33 @@ def _jdbc_url_to_dsn(url: str, user: str | None, password: str | None) -> str:
         dsn = f"{scheme}://{creds}{rest}"
 
     return dsn
+
+
+def _postgresql_dsn_with_properties(dsn: str, options: dict[str, str]) -> str:
+    """Map pgJDBC properties with exact libpq URI equivalents.
+
+    Spark forwards non-core data-source options to the JDBC driver. Sail does
+    not load that JVM driver, so only properties with identical libpq semantics
+    are translated here. Values already present in the URL retain pgJDBC's
+    documented precedence over the separate properties object.
+    """
+    names = {
+        "applicationname": "application_name",
+        "connecttimeout": "connect_timeout",
+        "sslmode": "sslmode",
+        "sslcert": "sslcert",
+        "sslkey": "sslkey",
+        "sslrootcert": "sslrootcert",
+        "options": "options",
+    }
+    normalized = {key.lower(): value for key, value in options.items()}
+    parts = urlsplit(dsn)
+    query = list(parse_qsl(parts.query, keep_blank_values=True))
+    present = {key.lower() for key, _ in query}
+    for source, target in names.items():
+        if source in normalized and target.lower() not in present:
+            query.append((target, normalized[source]))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
 # ============================================================================
@@ -1812,8 +1839,10 @@ class JdbcDataSource(DataSource):
 
     * Exactly one of ``dbtable`` or ``query`` is required.
 
-    Not supported: ``driver``, ``predicates`` list, ``queryTimeout``,
-    ``isolationLevel``, ``sessionInitStatement``, Kerberos.
+    The read path does not support ``driver``, ``predicates`` list,
+    ``queryTimeout``, ``isolationLevel``, ``sessionInitStatement``, or
+    Kerberos. The write path supports the native driver declarations,
+    ``queryTimeout``, and ``isolationLevel`` documented by its writer.
     """
 
     @classmethod
@@ -1855,6 +1884,8 @@ class JdbcDataSource(DataSource):
         user = opts.get("user") or None
         password = opts.get("password") or None
         conn_str = _jdbc_url_to_dsn(url, user, password)
+        if conn_str.startswith("postgresql://"):
+            conn_str = _postgresql_dsn_with_properties(conn_str, opts)
 
         # --- partitioning ---
         num_partitions = int(opts.get("numpartitions", "1"))
@@ -2016,6 +2047,8 @@ class JdbcDataSource(DataSource):
         user = opts.get("user") or None
         password = opts.get("password") or None
         conn_str = _jdbc_url_to_dsn(url, user, password)
+        if subprotocol == "postgresql":
+            conn_str = _postgresql_dsn_with_properties(conn_str, opts)
         try:
             batch_size = int(opts.get("batchsize", "1000"))
         except ValueError:

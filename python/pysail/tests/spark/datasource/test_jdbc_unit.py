@@ -78,6 +78,56 @@ def test_filter_to_sql_unit():
 # ---------------------------------------------------------------------------
 
 
+def test_postgresql_connection_properties_map_to_libpq_and_url_wins():
+    from pysail.spark.datasource.jdbc import _postgresql_dsn_with_properties
+
+    dsn = "postgresql://host/db?application_name=url-name"
+    actual = _postgresql_dsn_with_properties(
+        dsn,
+        {
+            "applicationname": "option-name",
+            "connecttimeout": "9",
+            "sslmode": "verify-full",
+            "sslrootcert": "/certs/root cert.pem",
+            "options": "-c statement_timeout=5000",
+        },
+    )
+
+    assert actual == (
+        "postgresql://host/db?application_name=url-name&connect_timeout=9"
+        "&sslmode=verify-full&sslrootcert=%2Fcerts%2Froot+cert.pem"
+        "&options=-c+statement_timeout%3D5000"
+    )
+
+
+def test_postgresql_connection_properties_are_case_insensitive():
+    from pysail.spark.datasource.jdbc import _postgresql_dsn_with_properties
+
+    assert _postgresql_dsn_with_properties(
+        "postgresql://host/db",
+        {"ApplicationName": "sail-review", "sslCert": "/tmp/client.pem", "sslKey": "/tmp/client.key"},
+    ) == ("postgresql://host/db?application_name=sail-review&sslcert=%2Ftmp%2Fclient.pem&sslkey=%2Ftmp%2Fclient.key")
+
+
+@pytest.mark.usefixtures("stub_target_exists")
+def test_postgresql_connection_properties_reach_reader_and_writer():
+    import pyarrow as pa
+
+    from pysail.spark.datasource.jdbc import JdbcDataSource
+
+    source = JdbcDataSource(
+        options={
+            "url": "jdbc:postgresql://host/db",
+            "dbtable": "events",
+            "ApplicationName": "sail-review",
+        }
+    )
+
+    assert source._resolve_options()["conn_str"].endswith("?application_name=sail-review")  # noqa: SLF001
+    writer = source.writer(pa.schema([("id", pa.int64())]), overwrite=False)
+    assert writer._conn_str.endswith("?application_name=sail-review")  # noqa: SLF001
+
+
 def test_jdbc_url_to_dsn_unit():
     from pysail.spark.datasource.jdbc import _jdbc_url_to_dsn
 
