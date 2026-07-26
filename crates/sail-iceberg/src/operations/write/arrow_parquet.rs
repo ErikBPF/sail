@@ -51,6 +51,13 @@ impl ArrowParquetWriter {
             .map_err(|e| format!("parquet write: {e}"))
     }
 
+    pub fn estimated_size(&self) -> usize {
+        self.writer
+            .as_ref()
+            .map(|writer| writer.bytes_written() + writer.in_progress_size())
+            .unwrap_or_default()
+    }
+
     pub async fn close(mut self) -> Result<(Bytes, ParquetFileMeta), String> {
         let mut writer = self.writer.take().ok_or("writer already closed")?;
         let metadata = writer

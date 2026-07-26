@@ -51,6 +51,9 @@ pub struct IcebergWriterExecOptions {
     pub shred_variants_explicit: bool,
     pub variant_inference_buffer_size: usize,
     pub variant_inference_buffer_size_explicit: bool,
+    pub compression_codec: Option<String>,
+    pub compression_level: Option<String>,
+    pub target_file_size_bytes: Option<u64>,
 }
 
 impl Default for IcebergWriterExecOptions {
@@ -66,6 +69,9 @@ impl Default for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: 100,
             variant_inference_buffer_size_explicit: false,
+            compression_codec: None,
+            compression_level: None,
+            target_file_size_bytes: None,
         }
     }
 }
@@ -83,6 +89,9 @@ impl From<IcebergWriteOptions> for IcebergWriterExecOptions {
             shred_variants_explicit: false,
             variant_inference_buffer_size: options.variant_inference_buffer_size,
             variant_inference_buffer_size_explicit: false,
+            compression_codec: options.compression_codec,
+            compression_level: options.compression_level,
+            target_file_size_bytes: options.target_file_size_bytes,
         }
     }
 }
