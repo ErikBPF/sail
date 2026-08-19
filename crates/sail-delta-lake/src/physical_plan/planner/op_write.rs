@@ -10,6 +10,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::SchemaRef;
@@ -18,6 +19,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::expressions::NotExpr;
 use datafusion::physical_expr::{LexRequirement, PhysicalExpr};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::union::UnionExec;
@@ -37,6 +39,7 @@ use crate::physical_plan::{
 };
 use crate::spec::{DeltaOperation, SaveMode};
 use crate::table::DeltaSnapshot;
+use crate::table_format::DeltaOptimizeOptions;
 
 pub async fn build_write_plan(
     ctx: &PlannerContext<'_>,
@@ -55,6 +58,155 @@ pub async fn build_write_plan(
         }
         _ => build_standard_plan(ctx, input, sink_mode, sort_order).await,
     }
+}
+
+pub async fn build_optimize_plan(
+    ctx: &PlannerContext<'_>,
+    input: Arc<dyn ExecutionPlan>,
+    sink_mode: PhysicalSinkMode,
+    sort_order: Option<LexRequirement>,
+    optimize: DeltaOptimizeOptions,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let table = ctx.open_table().await?;
+    let snapshot = table
+        .snapshot()
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .clone();
+    let partition_columns = snapshot.metadata().partition_columns().clone();
+    if optimize.predicate.is_none() && optimize.z_order_by.is_empty() {
+        let mut seen = HashSet::new();
+        let has_multiple_files = snapshot.adds().iter().any(|add| {
+            let partition = partition_columns
+                .iter()
+                .map(|column| {
+                    add.partition_values
+                        .get(column)
+                        .and_then(|value| value.as_deref())
+                })
+                .collect::<Vec<_>>();
+            !seen.insert(partition)
+        });
+        if !has_multiple_files {
+            return Ok(Arc::new(EmptyExec::new(input.schema())));
+        }
+    }
+
+    if let Some(column) = optimize.z_order_by.iter().find(|column| {
+        partition_columns
+            .iter()
+            .any(|part| part.eq_ignore_ascii_case(column))
+    }) {
+        return datafusion_common::plan_err!(
+            "Z-Ordering column {column:?} cannot be a partition column"
+        );
+    }
+
+    let condition = match &sink_mode {
+        PhysicalSinkMode::Overwrite => None,
+        PhysicalSinkMode::OverwriteIf {
+            condition: Some(condition),
+            ..
+        } => Some(condition.as_ref().clone()),
+        PhysicalSinkMode::OverwriteIf {
+            condition: None, ..
+        } => {
+            return datafusion_common::plan_err!(
+                "missing OPTIMIZE WHERE condition during physical planning"
+            );
+        }
+        _ => {
+            return datafusion_common::plan_err!(
+                "invalid sink mode for Delta OPTIMIZE: {sink_mode:?}"
+            );
+        }
+    };
+    if condition
+        .as_ref()
+        .is_some_and(|condition| predicate_requires_stats(&condition.expr, &partition_columns))
+    {
+        return datafusion_common::plan_err!(
+            "OPTIMIZE WHERE predicate can only reference partition columns"
+        );
+    }
+
+    let input_schema = input.schema();
+    let plan = create_projection(input, partition_columns.clone())?;
+    let plan = create_repartition(plan, partition_columns.clone(), 1)?;
+    // ponytail: local ZORDER is lexicographic; replace with Morton keys and Z-cube tags
+    // before declaring Delta Z-order compatibility.
+    let plan = create_sort(plan, partition_columns.clone(), sort_order)?;
+    let writer_schema = plan.schema();
+    let operation = DeltaOperation::Optimize {
+        predicate: optimize.predicate.clone(),
+        z_order_by: optimize.z_order_by.clone(),
+    };
+    let writer_options = DeltaWriterExecOptions::from(ctx.options().clone())
+        .with_generation_expressions(ctx.generation_expressions().clone())
+        .with_identity_columns(ctx.identity_columns().clone());
+    let write_context = crate::physical_plan::prepare_delta_write_context(
+        ctx.table_url(),
+        Some(snapshot.as_ref()),
+        &writer_options,
+        ctx.metadata_configuration(),
+        &partition_columns,
+        &sink_mode,
+        true,
+        &writer_schema,
+        Some(operation),
+    )?;
+    let writer: Arc<dyn ExecutionPlan> = Arc::new(DeltaWriterExec::new(
+        plan,
+        ctx.table_url().clone(),
+        writer_options,
+        ctx.metadata_configuration().clone(),
+        partition_columns.clone(),
+        sink_mode.clone(),
+        true,
+        writer_schema,
+        write_context.clone(),
+        ctx.lakehouse_table().cloned(),
+    )?);
+
+    let meta_scan = build_log_replay_pipeline_with_options(
+        ctx,
+        &snapshot,
+        LogReplayOptions {
+            include_stats_json: true,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let meta_scan = if let Some(condition) = condition {
+        build_metadata_filter(ctx.session(), meta_scan, &snapshot, condition.expr)?
+    } else {
+        meta_scan
+    };
+    let adds: Arc<dyn ExecutionPlan> = Arc::new(DeltaDiscoveryExec::with_input(
+        meta_scan,
+        ctx.table_url().clone(),
+        None,
+        None,
+        snapshot.version(),
+        partition_columns.clone(),
+        true,
+    )?);
+    let removes: Arc<dyn ExecutionPlan> = Arc::new(
+        DeltaRemoveActionsExec::try_new(adds, Some(snapshot.physical_partition_columns()))?
+            .with_data_change(false),
+    );
+    let actions = UnionExec::try_new(vec![writer, removes])?;
+
+    Ok(Arc::new(DeltaCommitExec::new(
+        Arc::new(CoalescePartitionsExec::new(actions)),
+        ctx.table_url().clone(),
+        partition_columns,
+        true,
+        input_schema,
+        sink_mode,
+        ctx.options().user_metadata.clone(),
+        write_context.commit_context.clone(),
+        ctx.lakehouse_table().cloned(),
+    )))
 }
 
 async fn build_standard_plan(

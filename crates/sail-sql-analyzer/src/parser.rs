@@ -169,4 +169,22 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn test_parse_optimize() -> SqlResult<()> {
+        for sql in [
+            "OPTIMIZE events",
+            "OPTIMIZE delta.`/tmp/events`",
+            "OPTIMIZE '/tmp/events'",
+            "OPTIMIZE events FULL",
+            "OPTIMIZE events WHERE event_date >= DATE '2026-01-01'",
+            "OPTIMIZE events ZORDER BY (event_type, user_id)",
+            "OPTIMIZE events ZORDER BY event_type, user_id",
+            "OPTIMIZE events WHERE event_date = DATE '2026-01-01' ZORDER BY (user_id)",
+        ] {
+            parse_one_statement(sql)
+                .unwrap_or_else(|error| panic!("failed to parse {sql:?}: {error}"));
+        }
+        Ok(())
+    }
 }

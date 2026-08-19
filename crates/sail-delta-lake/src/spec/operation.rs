@@ -80,6 +80,12 @@ pub enum DeltaOperation {
         #[serde(skip_serializing_if = "Option::is_none")]
         predicate: Option<String>,
     },
+    Optimize {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        predicate: Option<String>,
+        #[serde(default, rename = "zOrderBy", skip_serializing_if = "Vec::is_empty")]
+        z_order_by: Vec<String>,
+    },
     #[serde(rename_all = "camelCase")]
     Merge {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -126,6 +132,7 @@ impl DeltaOperation {
             Self::Create { .. } => "CREATE TABLE",
             Self::Write { .. } => "WRITE",
             Self::Delete { .. } => "DELETE",
+            Self::Optimize { .. } => "OPTIMIZE",
             Self::Merge { .. } => "MERGE",
             Self::FileSystemCheck { .. } => "FSCK",
             Self::Restore { .. } => "RESTORE",
@@ -182,6 +189,15 @@ impl DeltaOperation {
             Self::Delete { predicate } => {
                 insert_opt(&mut parameters, "predicate", predicate.clone());
             }
+            Self::Optimize {
+                predicate,
+                z_order_by,
+            } => {
+                insert_opt(&mut parameters, "predicate", predicate.clone());
+                if !z_order_by.is_empty() {
+                    insert_json(&mut parameters, "zOrderBy", z_order_by)?;
+                }
+            }
             Self::Merge {
                 predicate,
                 merge_predicate,
@@ -236,7 +252,7 @@ impl DeltaOperation {
     }
 
     pub fn changes_data(&self) -> bool {
-        !matches!(self, Self::FileSystemCheck {})
+        !matches!(self, Self::FileSystemCheck {} | Self::Optimize { .. })
     }
 
     pub fn get_commit_info(&self) -> CommitInfo {
@@ -262,6 +278,7 @@ impl DeltaOperation {
         match self {
             Self::Write { predicate, .. } => predicate.clone(),
             Self::Delete { predicate, .. } => predicate.clone(),
+            Self::Optimize { predicate, .. } => predicate.clone(),
             Self::Merge { predicate, .. } => predicate.clone(),
             _ => None,
         }
@@ -273,5 +290,31 @@ impl DeltaOperation {
             Self::Merge { predicate, .. } if predicate.is_none() => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeltaOperation;
+
+    #[test]
+    fn optimize_is_a_no_data_change_operation() {
+        let operation = DeltaOperation::Optimize {
+            predicate: Some("bucket = 1".to_string()),
+            z_order_by: vec!["id".to_string()],
+        };
+
+        assert_eq!(operation.name(), "OPTIMIZE");
+        assert!(!operation.changes_data());
+        assert_eq!(operation.read_predicate().as_deref(), Some("bucket = 1"));
+        let parameters = operation.operation_parameters_string_map().unwrap();
+        assert_eq!(
+            parameters.get("predicate").map(String::as_str),
+            Some("bucket = 1")
+        );
+        assert_eq!(
+            parameters.get("zOrderBy").map(String::as_str),
+            Some("[\"id\"]")
+        );
     }
 }

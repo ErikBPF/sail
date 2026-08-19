@@ -14,9 +14,9 @@ use sail_sql_parser::ast::statement::{
     ColumnPosition, ColumnTypeDefinition, CommentValue, CreateDatabaseClause, CreateTableClause,
     CreateViewClause, CreateViewDefinition, DeleteTableAlias, DescribeFunctionName, DescribeItem,
     ExplainFormat, FileFormat, InsertDirectoryDestination, MergeMatchClause, MergeMatchedAction,
-    MergeNotMatchedBySourceAction, MergeNotMatchedByTargetAction, MergeSource, PartitionByItem,
-    PartitionByList, PartitionClause, PartitionValue, PartitionValueList, PropertyKey,
-    PropertyKeyList, PropertyKeyValue, PropertyList, PropertyValue, RowFormat,
+    MergeNotMatchedBySourceAction, MergeNotMatchedByTargetAction, MergeSource, OptimizeColumnList,
+    PartitionByItem, PartitionByList, PartitionClause, PartitionValue, PartitionValueList,
+    PropertyKey, PropertyKeyList, PropertyKeyValue, PropertyList, PropertyValue, RowFormat,
     RowFormatDelimitedClause, SetClause, ShowFunctionScope, ShowFunctionsClause,
     ShowFunctionsPattern, SortColumn, SortColumnClause, SortColumnList, Statement,
     TableColumnIdentityOption, TableColumnIdentityOptions, UpdateTableAlias, ViewColumn,
@@ -1027,6 +1027,55 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 table_alias,
                 condition,
             };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::Optimize {
+            optimize: _,
+            target,
+            full,
+            r#where,
+            zorder,
+        } => {
+            let target = match target {
+                Either::Left(path) => spec::OptimizeTarget::Path {
+                    path: from_ast_string(path)?,
+                },
+                Either::Right(name) => spec::OptimizeTarget::Table {
+                    name: from_ast_object_name(name)?,
+                },
+            };
+            let condition = r#where
+                .map(|x| {
+                    let WhereClause {
+                        r#where: _,
+                        condition,
+                    } = x;
+                    let source = condition.text();
+                    Ok::<_, SqlError>(spec::ExprWithSource {
+                        expr: from_ast_expression(condition)?,
+                        source: Some(source),
+                    })
+                })
+                .transpose()?;
+            let z_order_by = zorder
+                .map(|x| match x.columns {
+                    OptimizeColumnList::Delimited { columns, .. }
+                    | OptimizeColumnList::NotDelimited { columns } => columns,
+                })
+                .map(|columns| {
+                    columns
+                        .into_items()
+                        .map(from_ast_object_name)
+                        .collect::<SqlResult<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let node = spec::CommandNode::Optimize(spec::Optimize {
+                target,
+                full: full.is_some(),
+                condition,
+                z_order_by,
+            });
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
         Statement::LoadData {

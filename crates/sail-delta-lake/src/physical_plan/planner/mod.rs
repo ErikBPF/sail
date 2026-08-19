@@ -17,6 +17,8 @@ use datafusion::physical_expr::LexRequirement;
 use datafusion::physical_plan::ExecutionPlan;
 use sail_common_datafusion::datasource::PhysicalSinkMode;
 
+use crate::table_format::DeltaOptimizeOptions;
+
 mod commit;
 pub mod context;
 mod log_scan;
@@ -55,5 +57,15 @@ impl<'a> DeltaPhysicalPlanner<'a> {
         sort_order: Option<LexRequirement>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         op_write::build_write_plan(&self.ctx, input, sink_mode, sort_order).await
+    }
+
+    pub async fn create_optimize_plan(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        sink_mode: PhysicalSinkMode,
+        sort_order: Option<LexRequirement>,
+        optimize: DeltaOptimizeOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        op_write::build_optimize_plan(&self.ctx, input, sink_mode, sort_order, optimize).await
     }
 }

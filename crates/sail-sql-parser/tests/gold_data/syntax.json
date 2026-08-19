@@ -2994,6 +2994,19 @@
               }
             },
             {
+              "name": "Either(StringLiteral, ObjectName)",
+              "node": {
+                "choice": [
+                  {
+                    "nonTerminal": "StringLiteral"
+                  },
+                  {
+                    "nonTerminal": "ObjectName"
+                  }
+                ]
+              }
+            },
+            {
               "name": "Either(Tuple(Keyword(By), Keyword(Name)), IdentList)",
               "node": {
                 "choice": [
@@ -5612,6 +5625,14 @@
               }
             },
             {
+              "name": "Keyword(Optimize)",
+              "node": {
+                "terminal": {
+                  "keyword": "OPTIMIZE"
+                }
+              }
+            },
+            {
               "name": "Keyword(Options)",
               "node": {
                 "terminal": {
@@ -6564,6 +6585,14 @@
               }
             },
             {
+              "name": "Keyword(Zorder)",
+              "node": {
+                "terminal": {
+                  "keyword": "ZORDER"
+                }
+              }
+            },
+            {
               "name": "LambdaFunctionParameters",
               "node": {
                 "choice": [
@@ -7277,6 +7306,49 @@
               }
             },
             {
+              "name": "OptimizeColumnList",
+              "node": {
+                "choice": [
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Operator(LeftParenthesis)"
+                      },
+                      {
+                        "nonTerminal": "Sequence(ObjectName, Operator(Comma))"
+                      },
+                      {
+                        "nonTerminal": "Operator(RightParenthesis)"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Sequence(ObjectName, Operator(Comma))"
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "OptimizeZOrder",
+              "node": {
+                "sequence": [
+                  {
+                    "nonTerminal": "Keyword(Zorder)"
+                  },
+                  {
+                    "nonTerminal": "Keyword(By)"
+                  },
+                  {
+                    "nonTerminal": "OptimizeColumnList"
+                  }
+                ]
+              }
+            },
+            {
               "name": "Option(AliasClause)",
               "node": {
                 "optional": {
@@ -7541,6 +7613,14 @@
               }
             },
             {
+              "name": "Option(Keyword(Full))",
+              "node": {
+                "optional": {
+                  "nonTerminal": "Keyword(Full)"
+                }
+              }
+            },
+            {
               "name": "Option(Keyword(Global))",
               "node": {
                 "optional": {
@@ -7689,6 +7769,14 @@
               "node": {
                 "optional": {
                   "nonTerminal": "Operator(Equals)"
+                }
+              }
+            },
+            {
+              "name": "Option(OptimizeZOrder)",
+              "node": {
+                "optional": {
+                  "nonTerminal": "OptimizeZOrder"
                 }
               }
             },
@@ -10158,6 +10246,25 @@
                       },
                       {
                         "nonTerminal": "Option(WhereClause)"
+                      }
+                    ]
+                  },
+                  {
+                    "sequence": [
+                      {
+                        "nonTerminal": "Keyword(Optimize)"
+                      },
+                      {
+                        "nonTerminal": "Either(StringLiteral, ObjectName)"
+                      },
+                      {
+                        "nonTerminal": "Option(Keyword(Full))"
+                      },
+                      {
+                        "nonTerminal": "Option(WhereClause)"
+                      },
+                      {
+                        "nonTerminal": "Option(OptimizeZOrder)"
                       }
                     ]
                   },

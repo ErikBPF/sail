@@ -11,14 +11,14 @@ use crate::ast::keywords::{
     Comment, Compute, Constraint, Cost, Create, Data, Database, Databases, Dbproperties, Default,
     Defined, Delete, Delimited, Desc, Describe, Directory, Distributed, Drop, Escaped, Evolution,
     Exists, Explain, Extended, External, Fields, Fileformat, First, For, Format, Formatted, From,
-    Function, Functions, Generated, Global, Identity, If, In, Increment, Inpath, Inputformat,
+    Full, Function, Functions, Generated, Global, Identity, If, In, Increment, Inpath, Inputformat,
     Insert, Into, Is, Items, Keys, Lazy, Like, Lines, Load, Local, Location, Map, Matched, Merge,
-    Name, Namespace, Namespaces, Noscan, Not, Null, On, Options, Or, Outputformat, Overwrite,
-    Partition, Partitioned, Partitions, Properties, Purge, Recover, Refresh, Rename, Replace,
-    Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set, Show, Sorted, Source, Start,
-    Statistics, Stored, System, Table, Tables, Target, Tblproperties, Temp, Temporary, Terminated,
-    Then, Time, To, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose, View, Views,
-    When, With, Zone,
+    Name, Namespace, Namespaces, Noscan, Not, Null, On, Optimize, Options, Or, Outputformat,
+    Overwrite, Partition, Partitioned, Partitions, Properties, Purge, Recover, Refresh, Rename,
+    Replace, Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set, Show, Sorted, Source,
+    Start, Statistics, Stored, System, Table, Tables, Target, Tblproperties, Temp, Temporary,
+    Terminated, Then, Time, To, Type, Uncache, Unset, Update, Use, User, Using, Values, Verbose,
+    View, Views, When, With, Zone, Zorder,
 };
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
@@ -268,6 +268,14 @@ pub enum Statement {
         #[parser(function = |(_, _, e, _), o| compose(e, o))]
         r#where: Option<WhereClause>,
     },
+    Optimize {
+        optimize: Optimize,
+        target: Either<StringLiteral, ObjectName>,
+        full: Option<Full>,
+        #[parser(function = |(_, _, e, _), o| compose(e, o))]
+        r#where: Option<WhereClause>,
+        zorder: Option<OptimizeZOrder>,
+    },
     LoadData {
         load_data: (Load, Data),
         local: Option<Local>,
@@ -347,6 +355,25 @@ pub enum Statement {
         name: ObjectName,
         is: Is,
         value: CommentValue,
+    },
+}
+
+#[derive(Debug, Clone, TreeParser, TreeSyntax, TreeText)]
+pub struct OptimizeZOrder {
+    pub zorder: Zorder,
+    pub by: By,
+    pub columns: OptimizeColumnList,
+}
+
+#[derive(Debug, Clone, TreeParser, TreeSyntax, TreeText)]
+pub enum OptimizeColumnList {
+    Delimited {
+        left: LeftParenthesis,
+        columns: Sequence<ObjectName, Comma>,
+        right: RightParenthesis,
+    },
+    NotDelimited {
+        columns: Sequence<ObjectName, Comma>,
     },
 }
 
